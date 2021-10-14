@@ -18,6 +18,7 @@ option cc_enable_arenas = true;
 package ray.rpc;
 
 option java_package = "io.ray.runtime.generated";
+option go_package = "./go";
 
 // Language of a task or worker.
 enum Language {

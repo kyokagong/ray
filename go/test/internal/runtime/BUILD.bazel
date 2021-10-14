@@ -1,0 +1,13 @@
+load("@io_bazel_rules_go//go:def.bzl", "go_test")
+
+
+go_test(
+    name = "object_store_test",
+    srcs = ["object_store_test.go"],
+    embed = [
+        "//go/internal/runtime/object:object_lib",
+    ],
+    deps = [
+        "@com_github_stretchr_testify//assert:go_default_library"
+    ]
+)

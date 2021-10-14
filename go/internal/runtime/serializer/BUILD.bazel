@@ -1,0 +1,13 @@
+load("@io_bazel_rules_go//go:def.bzl", "go_library")
+
+go_library(
+    name = "serializer_lib",
+    srcs = [
+        "serializer.go",
+    ],
+    importpath = "ray/internal/runtime/serializer",
+    visibility = ["//visibility:public"],
+    deps = [
+        "@com_github_vmihailenco_msgpack_v5//:go_default_library",
+    ]
+)

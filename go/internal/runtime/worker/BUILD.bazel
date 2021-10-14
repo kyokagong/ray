@@ -1,0 +1,41 @@
+load("@io_bazel_rules_go//go:def.bzl", "go_library")
+load("@rules_cc//cc:defs.bzl", "cc_library")
+
+go_library(
+    name = "worker",
+    srcs = [
+        "worker.go",
+        # "cgo_core_worker.h",
+    ],
+    cgo = True,
+    importpath = "ray/internal/runtime/worker",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//go/internal/runtime/config:config_lib",
+        "//go/internal/api:api"
+    ],
+    cdeps = [
+        ":cc_worker",
+    ],
+)
+
+
+cc_library(
+    name = "cc_worker",
+    srcs = [
+        "cgo_core_worker.cc"
+    ],
+    hdrs = [
+        "cgo_core_worker.h"
+    ],
+    copts = ["-std=c++14"],
+    deps = [
+        "//:core_worker_lib",
+        "//:ray_common",
+        "//:ray_util",
+        "@boost//:callable_traits",
+        "@boost//:dll",
+        "@com_github_gflags_gflags//:gflags",
+        "@msgpack",
+    ]
+)

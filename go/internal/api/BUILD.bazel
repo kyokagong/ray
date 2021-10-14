@@ -1,0 +1,18 @@
+load("@io_bazel_rules_go//go:def.bzl", "go_library")
+
+go_library(
+    name = "api_lib",
+    srcs = [
+        "ray.go",
+        "task_caller.go",
+    ],
+    importpath = "ray/internal/api",
+    visibility = ["//go:__subpackages__"],
+    deps = [
+        "//go/internal/runtime:runtime_lib",
+        "//go/internal/runtime/config:config_lib",
+        "//go/internal/runtime/object:object_lib",
+        "//go/internal/runtime/task:task_lib"
+    ],
+    gc_goopts = ["-G=3"]
+)

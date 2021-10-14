@@ -1,0 +1,8 @@
+load("@io_bazel_rules_go//go:def.bzl", "go_library")
+
+go_library(
+    name = "config_lib",
+    srcs = ["ray_config.go"],
+    importpath = "ray/internal/runtime/config",
+    visibility = ["//visibility:public"],
+)

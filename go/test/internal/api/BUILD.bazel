@@ -1,0 +1,13 @@
+load("@io_bazel_rules_go//go:def.bzl", "go_test")
+
+
+go_test(
+    name = "ray_test",
+    srcs = ["ray_test.go"],
+    embed = [
+        "//go/internal/api:api_lib",
+    ],
+    deps = [
+        "@com_github_stretchr_testify//assert:go_default_library",
+    ]
+)

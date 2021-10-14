@@ -1,0 +1,47 @@
+load("@io_bazel_rules_go//go:def.bzl", "go_library")
+
+genrule(
+    name = 'ccore_interface',
+    srcs = [
+        "ccore.i"
+    ],
+    outs = [
+        "ccore.cxx",
+        "ccore.go",
+    ],
+    cmd = "swig -c++ -go -intgosize 64 -cgo -Isrc -o $(locations ccore.cxx) $(locations ccore.i)",
+    local = True,
+    visibility = ["//visibility:public"],
+)
+
+go_library(
+    name = "ccore_lib",
+    srcs = [
+        "ccore.go",
+    ],
+    cgo = True,
+    importpath = "ray/internal/ccore",
+    visibility = ["//visibility:public"],
+    cdeps = [
+        ":ccore_native_lib",
+    ]
+)
+
+cc_library(
+    name = "ccore_native_lib",
+    srcs = [
+        "ccore_wrap.cxx",
+        "ccore_worker.cc",
+    ],
+    hdrs = [
+        "ccore_worker.h",
+    ],
+    copts = [
+        "-std=c++17",
+    ],
+    deps = [
+        "//:core_worker_lib",
+        "//:ray_common",
+        "@msgpack",
+    ]
+)

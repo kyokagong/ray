@@ -1,0 +1,18 @@
+load("@io_bazel_rules_go//go:def.bzl", "go_library")
+
+go_library(
+    name = "runtime_lib",
+    srcs = [
+        "runtime.go",
+        "local_ray_runtime.go",
+    ],
+    cgo = True,
+    importpath = "ray/internal/runtime",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//go/internal/runtime/config:config_lib",
+        "//go/internal/runtime/task:task_lib",
+        "//go/internal/runtime/runner:runner_lib",
+        "//go/internal/runtime/object:object_lib",
+    ]
+)

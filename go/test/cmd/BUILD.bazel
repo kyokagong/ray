@@ -1,0 +1,10 @@
+load("@io_bazel_rules_go//go:def.bzl", "go_test")
+
+
+go_test(
+    name = "defaut_worker_test",
+    srcs = ["default_worker_test.go"],
+    deps = [
+        "//go/internal/runtime/worker:worker"
+    ]
+)

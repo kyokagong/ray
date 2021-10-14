@@ -1,0 +1,18 @@
+load("@io_bazel_rules_go//go:def.bzl", "go_library")
+
+go_library(
+    name = "object_lib",
+    srcs = [
+        "local_object_store.go",
+        "native_object_store.go",
+        "object_ref.go",
+        "object_store.go",
+    ],
+    importpath = "ray/internal/runtime/object",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//go/internal/runtime/serializer:serializer_lib",
+        "@com_github_muesli_cache2go//:go_default_library",
+        "@com_github_google_uuid//:go_default_library",
+    ]
+)

@@ -1,0 +1,21 @@
+load("@io_bazel_rules_go//go:def.bzl", "go_binary", "go_library")
+load("//bazel:ray.bzl", "COPTS")
+
+go_library(
+    name = "default_worker_lib",
+    srcs = [
+        "main.go",
+    ],
+    cgo = True,
+    importpath = "ray/cmd/default_worker",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//go/internal/runtime/worker:worker"
+    ]
+)
+
+go_binary(
+    name = "default_worker",
+    embed = [":default_worker_lib"],
+    visibility = ["//visibility:public"],
+)

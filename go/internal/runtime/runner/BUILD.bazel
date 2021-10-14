@@ -1,0 +1,11 @@
+load("@io_bazel_rules_go//go:def.bzl", "go_library")
+
+go_library(
+    name = "runner_lib",
+    srcs = ["runner.go"],
+    importpath = "ray/internal/runtime/runner",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//go/internal/runtime/config:config_lib"
+    ]
+)

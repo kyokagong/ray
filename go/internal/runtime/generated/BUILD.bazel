@@ -1,0 +1,11 @@
+load("@io_bazel_rules_go//go:def.bzl", "go_library")
+
+go_library(
+    name = "go_proto_lib",
+    srcs = [
+        "common.pb.go",
+        "gcs.pb.go",
+    ],
+    importpath = "ray/internal/runtime/generated",
+    visibility = ["//visibility:public"],
+)

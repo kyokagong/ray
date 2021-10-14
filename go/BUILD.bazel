@@ -1,0 +1,45 @@
+
+load("@rules_proto_grpc//go:defs.bzl", "go_proto_compile")
+
+
+go_proto_compile(
+    name = "gcs_go_proto",
+    deps = ["@//src/ray/protobuf:gcs_proto"],
+)
+
+go_proto_compile(
+    name = "serve_go_proto",
+    deps = ["@//src/ray/protobuf:serve_proto"],
+)
+
+filegroup(
+    name = "all_go_proto",
+    srcs = [
+        ":gcs_go_proto",
+    ],
+)
+
+
+# Generates the dependencies go protobuf code.
+genrule(
+    name = "cp_go_proto_generated",
+    srcs = [
+        ":all_go_proto",
+    ],
+    outs = ["cp_go_generated.out"],
+    cmd = """
+        WORK_DIR="$$(pwd)"
+        # Copy protobuf-generated files.
+        rm -rf "$$WORK_DIR/go/internal/runtime/generated"
+        mkdir -p "$$WORK_DIR/go/internal/runtime/generated"
+        for f in $(locations //go:all_go_proto); do
+            if [ ! -x "$$WORK_DIR/go/internal/runtime/generated/$$f" ]; then
+                echo "$$WORK_DIR/go/internal/runtime/generated/$$f"
+                cp -i "$$f" "$$WORK_DIR/go/internal/runtime/generated/"
+            fi
+        done
+        date > $@
+    """,
+    local = 1,
+    tags = ["no-cache"],
+)

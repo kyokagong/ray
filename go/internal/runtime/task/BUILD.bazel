@@ -1,0 +1,17 @@
+load("@io_bazel_rules_go//go:def.bzl", "go_library")
+
+go_library(
+    name = "task_lib",
+    srcs = [
+        "task_executor.go",
+        "task_submitter.go",
+        "function_manager.go",
+        "local_task_executor.go",
+        "local_task_submitter.go",
+    ],
+    importpath = "ray/internal/runtime/task",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//go/internal/runtime/generated:go_proto_lib"
+    ]
+)
