@@ -22,8 +22,7 @@
 RAY_CONFIG(uint64_t, debug_dump_period_milliseconds, 10000)
 
 /// Whether to enable Ray event stats collection.
-/// TODO(ekl) this seems to segfault Java unit tests when on by default?
-RAY_CONFIG(bool, event_stats, false)
+RAY_CONFIG(bool, event_stats, true)
 
 /// Whether to enable Ray legacy scheduler warnings. These are replaced by
 /// autoscaler messages after https://github.com/ray-project/ray/pull/18724.
@@ -97,11 +96,6 @@ RAY_CONFIG(bool, lineage_pinning_enabled, false)
 /// upfront and can slow down Ray startup.
 /// See also: https://github.com/ray-project/ray/issues/14182
 RAY_CONFIG(bool, preallocate_plasma_memory, false)
-
-/// Whether to use the hybrid scheduling policy, or one of the legacy spillback
-/// strategies. In the hybrid scheduling strategy, leases are packed until a threshold,
-/// then spread via weighted (by critical resource usage).
-RAY_CONFIG(bool, scheduler_hybrid_scheduling, true)
 
 /// The fraction of resource utilization on a node after which the scheduler starts
 /// to prefer spreading tasks to other nodes. This balances between locality and
@@ -475,7 +469,7 @@ RAY_CONFIG(int64_t, grpc_keepalive_time_ms, 10000);
 RAY_CONFIG(int64_t, grpc_keepalive_timeout_ms, 20000);
 
 /// Whether to use log reporter in event framework
-RAY_CONFIG(bool, event_log_reporter_enabled, true)
+RAY_CONFIG(bool, event_log_reporter_enabled, false)
 
 /// Whether to enable register actor async.
 /// If it is false, the actor registration to GCS becomes synchronous, i.e.,
@@ -492,3 +486,11 @@ RAY_CONFIG(bool, scheduler_avoid_gpu_nodes, true)
 
 /// Whether to skip running local GC in runtime env.
 RAY_CONFIG(bool, runtime_env_skip_local_gc, false)
+
+/// Whether or not use TLS.
+RAY_CONFIG(bool, USE_TLS, false)
+
+/// Location of TLS credentials
+RAY_CONFIG(std::string, TLS_SERVER_CERT, "")
+RAY_CONFIG(std::string, TLS_SERVER_KEY, "")
+RAY_CONFIG(std::string, TLS_CA_CERT, "")
