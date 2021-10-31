@@ -79,6 +79,7 @@ CORE_NIGHTLY_TESTS = {
         SmokeTest("dask_on_ray_large_scale_test_no_spilling"),
         SmokeTest("dask_on_ray_large_scale_test_spilling"),
         "stress_test_placement_group",
+        "grpc_stress_test_placement_group",
         "shuffle_1tb_1000_partition",
         "non_streaming_shuffle_1tb_1000_partition",
         "shuffle_1tb_5000_partitions",
@@ -124,6 +125,7 @@ NIGHTLY_TESTS = {
         "dask_on_ray_large_scale_test_no_spilling",
         "dask_on_ray_large_scale_test_spilling",
         "pg_autoscaling_regression_test",
+        "grpc_pg_autoscaling_regression_test",
     ],
     "~/ray/release/long_running_tests/long_running_tests.yaml": [
         SmokeTest("actor_deaths"),
@@ -144,6 +146,12 @@ NIGHTLY_TESTS = {
     ],
     "~/ray/release/sgd_tests/sgd_tests.yaml": [
         "sgd_gpu",
+    ],
+    "~/ray/release/tune_tests/cloud_tests/tune_cloud_tests.yaml": [
+        "aws_no_sync_down",
+        "aws_ssh_sync",
+        "aws_durable_upload",
+        "gcp_k8s_durable_upload",
     ],
     "~/ray/release/tune_tests/scalability_tests/tune_tests.yaml": [
         "bookkeeping_overhead",
@@ -233,7 +241,7 @@ MANUAL_TESTS = {
     "~/ray/release/long_running_tests/long_running_tests.yaml": [
         SmokeTest("serve"),
         SmokeTest("serve_failure"),
-    ]
+    ],
 }
 
 # This test suite holds "user" tests to test important user workflows
@@ -483,8 +491,10 @@ def create_test_step(
             + pip_requirements_command \
             + step_conf["commands"]
 
-    step_conf["label"] = f"{ray_wheels_str}{test_name} ({ray_branch}) - " \
-                         f"{ray_test_branch}/{ray_test_repo}"
+    step_conf["label"] = (
+        f"{test_name} "
+        f"({'custom_wheels_url' if ray_wheels_str else ray_branch}) - "
+        f"{ray_test_branch}/{ray_test_repo}")
     return step_conf
 
 
