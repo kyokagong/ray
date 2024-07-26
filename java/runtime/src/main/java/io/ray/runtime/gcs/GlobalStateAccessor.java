@@ -1,11 +1,10 @@
 package io.ray.runtime.gcs;
 
 import com.google.common.base.Preconditions;
-import io.ray.api.Ray;
 import io.ray.api.id.ActorId;
+import io.ray.api.id.JobId;
 import io.ray.api.id.PlacementGroupId;
-import io.ray.api.id.UniqueId;
-import io.ray.runtime.RayRuntimeInternal;
+import io.ray.api.runtimecontext.ActorState;
 import java.util.List;
 
 /** `GlobalStateAccessor` is used for accessing information from GCS. */
@@ -16,9 +15,9 @@ public class GlobalStateAccessor {
   private static GlobalStateAccessor globalStateAccessor;
 
   public static synchronized GlobalStateAccessor getInstance(
-      String redisAddress, String redisPassword) {
+      String bootstrapAddress, String redisPassword) {
     if (null == globalStateAccessor) {
-      globalStateAccessor = new GlobalStateAccessor(redisAddress, redisPassword);
+      globalStateAccessor = new GlobalStateAccessor(bootstrapAddress, redisPassword);
     }
     return globalStateAccessor;
   }
@@ -30,8 +29,9 @@ public class GlobalStateAccessor {
     }
   }
 
-  private GlobalStateAccessor(String redisAddress, String redisPassword) {
-    globalStateAccessorNativePointer = nativeCreateGlobalStateAccessor(redisAddress, redisPassword);
+  private GlobalStateAccessor(String bootstrapAddress, String redisPassword) {
+    globalStateAccessorNativePointer =
+        nativeCreateGlobalStateAccessor(bootstrapAddress, redisPassword);
     validateGlobalStateAccessorPointer();
     connect();
   }
@@ -73,19 +73,6 @@ public class GlobalStateAccessor {
     }
   }
 
-  /**
-   * Get node resource info.
-   *
-   * @param nodeId node unique id.
-   * @return A map of node resource info in protobuf schema.
-   */
-  public byte[] getNodeResourceInfo(UniqueId nodeId) {
-    synchronized (GlobalStateAccessor.class) {
-      validateGlobalStateAccessorPointer();
-      return nativeGetNodeResourceInfo(globalStateAccessorNativePointer, nodeId.getBytes());
-    }
-  }
-
   public byte[] getPlacementGroupInfo(PlacementGroupId placementGroupId) {
     synchronized (GlobalStateAccessor.class) {
       validateGlobalStateAccessorPointer();
@@ -94,12 +81,10 @@ public class GlobalStateAccessor {
     }
   }
 
-  public byte[] getPlacementGroupInfo(String name, boolean global) {
+  public byte[] getPlacementGroupInfo(String name, String namespace) {
     synchronized (GlobalStateAccessor.class) {
       validateGlobalStateAccessorPointer();
-      RayRuntimeInternal runtime = (RayRuntimeInternal) Ray.internal();
-      return nativeGetPlacementGroupInfoByName(
-          globalStateAccessorNativePointer, name, runtime.getRayConfig().namespace, global);
+      return nativeGetPlacementGroupInfoByName(globalStateAccessorNativePointer, name, namespace);
     }
   }
 
@@ -110,19 +95,28 @@ public class GlobalStateAccessor {
     }
   }
 
-  public byte[] getInternalKV(String k) {
+  public byte[] getInternalKV(String n, String k) {
     synchronized (GlobalStateAccessor.class) {
       validateGlobalStateAccessorPointer();
-      return this.nativeGetInternalKV(globalStateAccessorNativePointer, k);
+      return this.nativeGetInternalKV(globalStateAccessorNativePointer, n, k);
     }
   }
 
   /** Returns A list of actor info with ActorInfo protobuf schema. */
-  public List<byte[]> getAllActorInfo() {
+  public List<byte[]> getAllActorInfo(JobId jobId, ActorState actorState) {
     // Fetch a actor list with protobuf bytes format from GCS.
     synchronized (GlobalStateAccessor.class) {
       validateGlobalStateAccessorPointer();
-      return this.nativeGetAllActorInfo(globalStateAccessorNativePointer);
+      byte[] jobIdBytes = null;
+      String actorStateName = null;
+      if (jobId != null) {
+        jobIdBytes = jobId.getBytes();
+      }
+      if (actorState != null) {
+        actorStateName = actorState.getName();
+      }
+      return this.nativeGetAllActorInfo(
+          globalStateAccessorNativePointer, jobIdBytes, actorStateName);
     }
   }
 
@@ -166,20 +160,19 @@ public class GlobalStateAccessor {
 
   private native List<byte[]> nativeGetAllNodeInfo(long nativePtr);
 
-  private native byte[] nativeGetNodeResourceInfo(long nativePtr, byte[] nodeId);
-
-  private native List<byte[]> nativeGetAllActorInfo(long nativePtr);
+  private native List<byte[]> nativeGetAllActorInfo(
+      long nativePtr, byte[] jobId, String actorStateName);
 
   private native byte[] nativeGetActorInfo(long nativePtr, byte[] actorId);
 
   private native byte[] nativeGetPlacementGroupInfo(long nativePtr, byte[] placementGroupId);
 
   private native byte[] nativeGetPlacementGroupInfoByName(
-      long nativePtr, String name, String namespace, boolean global);
+      long nativePtr, String name, String namespace);
 
   private native List<byte[]> nativeGetAllPlacementGroupInfo(long nativePtr);
 
-  private native byte[] nativeGetInternalKV(long nativePtr, String k);
+  private native byte[] nativeGetInternalKV(long nativePtr, String n, String k);
 
   private native byte[] nativeGetNodeToConnectForDriver(long nativePtr, String nodeIpAddress);
 }

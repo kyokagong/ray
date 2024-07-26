@@ -7,7 +7,7 @@ import threading
 import time
 
 from ray._private.test_utils import monitor_memory_usage
-from ray.data.impl.progress_bar import ProgressBar
+from ray.data._internal.progress_bar import ProgressBar
 
 from collections import namedtuple
 from queue import Queue
@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 PiResult = namedtuple("PiResult", ["samples", "pi"])
 
 
-@ray.remote(num_cpus=1)
+@ray.remote(num_cpus=0)
 class PiCalculator:
     def __init__(self, metadata):
         # -- Read only variables --
@@ -50,8 +50,7 @@ class PiCalculator:
             # Put the result to the queue.
             sample_cnt += self.sample_batch
             with self.lock:
-                self.result_queue.put(
-                    PiResult(samples=sample_cnt, pi=approx_pi))
+                self.result_queue.put(PiResult(samples=sample_cnt, pi=approx_pi))
 
     def stop(self):
         self.is_running = False
@@ -65,14 +64,14 @@ class PiCalculator:
             with self.lock:
                 if not self.result_queue.empty():
                     result = self.result_queue.get(block=False)
-                time.sleep(1)
+            time.sleep(1)
         return result
 
 
-def start_actors(num_actors, num_nodes):
-    """Create actors and run the computation loop.
-    """
-    num_actors = int(num_actors)
+def start_actors(total_num_actors, num_nodes):
+    """Create actors and run the computation loop."""
+    total_num_actors = int(total_num_actors)
+    actors_per_node = int(total_num_actors / num_nodes)
     start = time.time()
     nodes = []
     # Place an actor per node in round-robin.
@@ -80,18 +79,19 @@ def start_actors(num_actors, num_nodes):
     while len(nodes) < num_nodes:
         nodes = [
             next((r for r in n["Resources"] if "node" in r), None)
-            for n in ray.nodes() if n["Alive"]
+            for n in ray.nodes()
+            if n["Alive"]
         ]
         nodes = [n for n in nodes if n is not None]
     pi_actors = [
-        PiCalculator.options(resources={
-            n: 0.01
-        }, max_concurrency=10).remote({
-            "meta": 1
-        }) for n in nodes for _ in range(num_actors)
+        PiCalculator.options(resources={n: 0.01}, max_concurrency=10).remote(
+            {"meta": 1}
+        )
+        for n in nodes
+        for _ in range(actors_per_node)
     ]
     ray.get([actor.ready.remote() for actor in pi_actors])
-    print(f"Took {time.time() - start} to create {num_actors} actors")
+    print(f"Took {time.time() - start} to create {total_num_actors} actors")
     # Start the computation loop.
     for actor in pi_actors:
         actor.run_compute.remote()
@@ -101,7 +101,7 @@ def start_actors(num_actors, num_nodes):
 def parse_script_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--kill-interval_s", type=float, default=60)
-    parser.add_argument("--test-runtime", type=float, default=3600)
+    parser.add_argument("--test-runtime", type=float, default=3000)
     return parser.parse_known_args()
 
 
@@ -135,7 +135,7 @@ def main():
             # Get the metadata.
             ray.get([actor.get_metadata.remote() for actor in actors])
             # Get the result.
-            pb = ProgressBar("Computing Pi", num_cpus)
+            pb = ProgressBar("Computing Pi", num_cpus, "actor")
             results = [actor.get_pi.remote() for actor in actors]
             pb.fetch_until_complete(results)
             pb.close()

@@ -1,32 +1,30 @@
-from ray.core.generated.common_pb2 import ErrorType
-import enum
 import logging
-from typing import List
-from ray.core.generated import gcs_service_pb2_grpc
-from ray.core.generated import gcs_service_pb2
+from typing import Optional
+
+from ray._private import ray_constants
+
+import ray._private.gcs_aio_client
+
+from ray.core.generated.common_pb2 import ErrorType, JobConfig
 from ray.core.generated.gcs_pb2 import (
     ActorTableData,
-    GcsNodeInfo,
     AvailableResources,
-    JobTableData,
-    JobConfig,
+    TotalResources,
     ErrorTableData,
     GcsEntry,
-    ResourceUsageBatchData,
-    ResourcesData,
+    GcsNodeInfo,
+    JobTableData,
     ObjectTableData,
-    ProfileTableData,
-    TablePrefix,
-    TablePubsub,
-    TaskTableData,
+    PlacementGroupTableData,
+    PubSubMessage,
     ResourceDemand,
     ResourceLoad,
-    ResourceMap,
-    ResourceTableData,
-    ObjectLocationInfo,
-    PubSubMessage,
+    ResourcesData,
+    ResourceUsageBatchData,
+    TablePrefix,
+    TablePubsub,
+    TaskEvents,
     WorkerTableData,
-    PlacementGroupTableData,
 )
 
 logger = logging.getLogger(__name__)
@@ -35,6 +33,7 @@ __all__ = [
     "ActorTableData",
     "GcsNodeInfo",
     "AvailableResources",
+    "TotalResources",
     "JobTableData",
     "JobConfig",
     "ErrorTableData",
@@ -43,157 +42,108 @@ __all__ = [
     "ResourceUsageBatchData",
     "ResourcesData",
     "ObjectTableData",
-    "ProfileTableData",
     "TablePrefix",
     "TablePubsub",
-    "TaskTableData",
+    "TaskEvents",
     "ResourceDemand",
     "ResourceLoad",
-    "ResourceMap",
-    "ResourceTableData",
-    "construct_error_message",
-    "ObjectLocationInfo",
     "PubSubMessage",
     "WorkerTableData",
     "PlacementGroupTableData",
 ]
 
-FUNCTION_PREFIX = "RemoteFunction:"
-LOG_FILE_CHANNEL = "RAY_LOG_CHANNEL"
-REPORTER_CHANNEL = "RAY_REPORTER"
-
-# xray resource usages
-XRAY_RESOURCES_BATCH_PATTERN = "RESOURCES_BATCH:".encode("ascii")
-
-# xray job updates
-XRAY_JOB_PATTERN = "JOB:*".encode("ascii")
-
-# Actor pub/sub updates
-RAY_ACTOR_PUBSUB_PATTERN = "ACTOR:*".encode("ascii")
-
-# Reporter pub/sub updates
-RAY_REPORTER_PUBSUB_PATTERN = "RAY_REPORTER.*".encode("ascii")
-
-RAY_ERROR_PUBSUB_PATTERN = "ERROR_INFO:*".encode("ascii")
-
-# These prefixes must be kept up-to-date with the TablePrefix enum in
-# gcs.proto.
-# TODO(rkn): We should use scoped enums, in which case we should be able to
-# just access the flatbuffer generated values.
-TablePrefix_RAYLET_TASK_string = "RAYLET_TASK"
-TablePrefix_OBJECT_string = "OBJECT"
-TablePrefix_PROFILE_string = "PROFILE"
-TablePrefix_JOB_string = "JOB"
-TablePrefix_ACTOR_string = "ACTOR"
 
 WORKER = 0
 DRIVER = 1
 
+# Cap messages at 512MB
+_MAX_MESSAGE_LENGTH = 512 * 1024 * 1024
+# Send keepalive every 60s
+_GRPC_KEEPALIVE_TIME_MS = 60 * 1000
+# Keepalive should be replied < 60s
+_GRPC_KEEPALIVE_TIMEOUT_MS = 60 * 1000
 
-def construct_error_message(job_id, error_type, message, timestamp):
-    """Construct a serialized ErrorTableData object.
+# Also relying on these defaults:
+# grpc.keepalive_permit_without_calls=0: No keepalive without inflight calls.
+# grpc.use_local_subchannel_pool=0: Subchannels are shared.
+_GRPC_OPTIONS = [
+    *ray_constants.GLOBAL_GRPC_OPTIONS,
+    ("grpc.max_send_message_length", _MAX_MESSAGE_LENGTH),
+    ("grpc.max_receive_message_length", _MAX_MESSAGE_LENGTH),
+    ("grpc.keepalive_time_ms", _GRPC_KEEPALIVE_TIME_MS),
+    ("grpc.keepalive_timeout_ms", _GRPC_KEEPALIVE_TIMEOUT_MS),
+]
+
+
+def create_gcs_channel(address: str, aio=False):
+    """Returns a GRPC channel to GCS.
 
     Args:
-        job_id: The ID of the job that the error should go to. If this is
-            nil, then the error will go to all drivers.
-        error_type: The type of the error.
-        message: The error message.
-        timestamp: The time of the error.
-
+        address: GCS address string, e.g. ip:port
+        aio: Whether using grpc.aio
     Returns:
-        The serialized object.
+        grpc.Channel or grpc.aio.Channel to GCS
     """
-    data = ErrorTableData()
-    data.job_id = job_id.binary()
-    data.type = error_type
-    data.error_message = message
-    data.timestamp = timestamp
-    return data.SerializeToString()
+    from ray._private.utils import init_grpc_channel
+
+    return init_grpc_channel(address, options=_GRPC_OPTIONS, asynchronous=aio)
 
 
-class GcsCode(enum.IntEnum):
-    # corresponding to ray/src/ray/common/status.h
-    OK = 0
-    NotFound = 17
+class GcsChannel:
+    def __init__(self, gcs_address: Optional[str] = None, aio: bool = False):
+        self._gcs_address = gcs_address
+        self._aio = aio
+
+    @property
+    def address(self):
+        return self._gcs_address
+
+    def connect(self):
+        # GCS server uses a cached port, so it should use the same port after
+        # restarting. This means GCS address should stay the same for the
+        # lifetime of the Ray cluster.
+        self._channel = create_gcs_channel(self._gcs_address, self._aio)
+
+    def channel(self):
+        return self._channel
 
 
-class GcsClient:
-    MAX_MESSAGE_LENGTH = 512 * 1024 * 1024  # 512MB
+# re-export
+GcsAioClient = ray._private.gcs_aio_client.GcsAioClient
 
-    def __init__(self, address):
-        from ray._private.utils import init_grpc_channel
-        logger.debug(f"Connecting to gcs address: {address}")
-        options = [("grpc.enable_http_proxy",
-                    0), ("grpc.max_send_message_length",
-                         GcsClient.MAX_MESSAGE_LENGTH),
-                   ("grpc.max_receive_message_length",
-                    GcsClient.MAX_MESSAGE_LENGTH)]
-        channel = init_grpc_channel(address, options=options)
-        self._kv_stub = gcs_service_pb2_grpc.InternalKVGcsServiceStub(channel)
 
-    def internal_kv_get(self, key: bytes) -> bytes:
-        logger.debug(f"internal_kv_get {key}")
-        req = gcs_service_pb2.InternalKVGetRequest(key=key)
-        reply = self._kv_stub.InternalKVGet(req)
-        if reply.status.code == GcsCode.OK:
-            return reply.value
-        elif reply.status.code == GcsCode.NotFound:
-            return None
-        else:
-            raise RuntimeError(f"Failed to get value for key {key} "
-                               f"due to error {reply.status.message}")
+def cleanup_redis_storage(
+    host: str, port: int, password: str, use_ssl: bool, storage_namespace: str
+):
+    """This function is used to cleanup the storage. Before we having
+    a good design for storage backend, it can be used to delete the old
+    data. It support redis cluster and non cluster mode.
 
-    def internal_kv_put(self, key: bytes, value: bytes,
-                        overwrite: bool) -> int:
-        logger.debug(f"internal_kv_put {key} {value} {overwrite}")
-        req = gcs_service_pb2.InternalKVPutRequest(
-            key=key, value=value, overwrite=overwrite)
-        reply = self._kv_stub.InternalKVPut(req)
-        if reply.status.code == GcsCode.OK:
-            return reply.added_num
-        else:
-            raise RuntimeError(f"Failed to put value {value} to key {key} "
-                               f"due to error {reply.status.message}")
+    Args:
+       host: The host address of the Redis.
+       port: The port of the Redis.
+       password: The password of the Redis.
+       use_ssl: Whether to encrypt the connection.
+       storage_namespace: The namespace of the storage to be deleted.
+    """
 
-    def internal_kv_del(self, key: bytes) -> int:
-        logger.debug(f"internal_kv_del {key}")
-        req = gcs_service_pb2.InternalKVDelRequest(key=key)
-        reply = self._kv_stub.InternalKVDel(req)
-        if reply.status.code == GcsCode.OK:
-            return reply.deleted_num
-        else:
-            raise RuntimeError(f"Failed to delete key {key} "
-                               f"due to error {reply.status.message}")
+    from ray._raylet import del_key_from_storage  # type: ignore
 
-    def internal_kv_exists(self, key: bytes) -> bool:
-        logger.debug(f"internal_kv_exists {key}")
-        req = gcs_service_pb2.InternalKVExistsRequest(key=key)
-        reply = self._kv_stub.InternalKVExists(req)
-        if reply.status.code == GcsCode.OK:
-            return reply.exists
-        else:
-            raise RuntimeError(f"Failed to check existence of key {key} "
-                               f"due to error {reply.status.message}")
+    if not isinstance(host, str):
+        raise ValueError("Host must be a string")
 
-    def internal_kv_keys(self, prefix: bytes) -> List[bytes]:
-        logger.debug(f"internal_kv_keys {prefix}")
-        req = gcs_service_pb2.InternalKVKeysRequest(prefix=prefix)
-        reply = self._kv_stub.InternalKVKeys(req)
-        if reply.status.code == GcsCode.OK:
-            return list(reply.results)
-        else:
-            raise RuntimeError(f"Failed to list prefix {prefix} "
-                               f"due to error {reply.status.message}")
+    if not isinstance(password, str):
+        raise ValueError("Password must be a string")
 
-    @staticmethod
-    def create_from_redis(redis_cli):
-        gcs_address = redis_cli.get("GcsServerAddress")
-        if gcs_address is None:
-            raise RuntimeError("Failed to look up gcs address through redis")
-        return GcsClient(gcs_address.decode())
+    if port < 0:
+        raise ValueError(f"Invalid port: {port}")
 
-    @staticmethod
-    def connect_to_gcs_by_redis_address(redis_address, redis_password):
-        from ray._private.services import create_redis_client
-        return GcsClient.create_from_redis(
-            create_redis_client(redis_address, redis_password))
+    if not isinstance(use_ssl, bool):
+        raise TypeError("use_ssl must be a boolean")
+
+    if not isinstance(storage_namespace, str):
+        raise ValueError("storage namespace must be a string")
+
+    # Right now, GCS store all data into a hash set key by storage_namespace.
+    # So we only need to delete the specific key to cleanup the cluster.
+    return del_key_from_storage(host, port, password, use_ssl, storage_namespace)

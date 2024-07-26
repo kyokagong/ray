@@ -23,7 +23,8 @@ namespace ray {
 namespace rpc {
 class TestServiceHandler {
  public:
-  void HandlePing(const PingRequest &request, PingReply *reply,
+  void HandlePing(PingRequest request,
+                  PingReply *reply,
                   SendReplyCallback send_reply_callback) {
     RAY_LOG(INFO) << "Got ping request, no_reply=" << request.no_reply();
     request_count++;
@@ -45,6 +46,25 @@ class TestServiceHandler {
           reply_failure_count++;
         });
   }
+
+  void HandlePingTimeout(PingTimeoutRequest request,
+                         PingTimeoutReply *reply,
+                         SendReplyCallback send_reply_callback) {
+    while (frozen) {
+      RAY_LOG(INFO) << "Server is frozen...";
+      std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+    }
+    RAY_LOG(INFO) << "Handling and replying request.";
+    send_reply_callback(
+        ray::Status::OK(),
+        /*reply_success=*/[]() { RAY_LOG(INFO) << "Reply success."; },
+        /*reply_failure=*/
+        [this]() {
+          RAY_LOG(INFO) << "Reply failed.";
+          reply_failure_count++;
+        });
+  }
+
   std::atomic<int> request_count{0};
   std::atomic<int> reply_failure_count{0};
   std::atomic<bool> frozen{false};
@@ -64,8 +84,12 @@ class TestGrpcService : public GrpcService {
 
   void InitServerCallFactories(
       const std::unique_ptr<grpc::ServerCompletionQueue> &cq,
-      std::vector<std::unique_ptr<ServerCallFactory>> *server_call_factories) override {
-    RPC_SERVICE_HANDLER(TestService, Ping, /*max_active_rpcs=*/1);
+      std::vector<std::unique_ptr<ServerCallFactory>> *server_call_factories,
+      const ClusterID &cluster_id) override {
+    RPC_SERVICE_HANDLER_CUSTOM_AUTH(
+        TestService, Ping, /*max_active_rpcs=*/1, AuthType::NO_AUTH);
+    RPC_SERVICE_HANDLER_CUSTOM_AUTH(
+        TestService, PingTimeout, /*max_active_rpcs=*/1, AuthType::NO_AUTH);
   }
 
  private:
@@ -86,7 +110,7 @@ class TestGrpcServerClientFixture : public ::testing::Test {
     });
     test_service_.reset(new TestGrpcService(handler_io_service_, test_service_handler_));
     grpc_server_.reset(new GrpcServer("test", 0, true));
-    grpc_server_->RegisterService(*test_service_);
+    grpc_server_->RegisterService(*test_service_, false);
     grpc_server_->Run();
 
     // Wait until server starts listening.
@@ -101,8 +125,8 @@ class TestGrpcServerClientFixture : public ::testing::Test {
       client_io_service_.run();
     });
     client_call_manager_.reset(new ClientCallManager(client_io_service_));
-    grpc_client_.reset(new GrpcClient<TestService>("127.0.0.1", grpc_server_->GetPort(),
-                                                   *client_call_manager_));
+    grpc_client_.reset(new GrpcClient<TestService>(
+        "127.0.0.1", grpc_server_->GetPort(), *client_call_manager_));
   }
 
   void ShutdownClient() {
@@ -129,7 +153,11 @@ class TestGrpcServerClientFixture : public ::testing::Test {
   }
 
  protected:
-  VOID_RPC_CLIENT_METHOD(TestService, Ping, grpc_client_, )
+  VOID_RPC_CLIENT_METHOD(TestService, Ping, grpc_client_, /*method_timeout_ms*/ -1, )
+  VOID_RPC_CLIENT_METHOD(TestService,
+                         PingTimeout,
+                         grpc_client_,
+                         /*method_timeout_ms*/ 100, )
   // Server
   TestServiceHandler test_service_handler_;
   instrumented_io_context handler_io_service_;
@@ -184,10 +212,12 @@ TEST_F(TestGrpcServerClientFixture, TestClientCallManagerTimeout) {
   // Reinit ClientCallManager with short timeout.
   grpc_client_.reset();
   client_call_manager_.reset();
-  client_call_manager_.reset(new ClientCallManager(client_io_service_, /*num_thread=*/1,
+  client_call_manager_.reset(new ClientCallManager(client_io_service_,
+                                                   ClusterID::Nil(),
+                                                   /*num_thread=*/1,
                                                    /*call_timeout_ms=*/100));
-  grpc_client_.reset(new GrpcClient<TestService>("127.0.0.1", grpc_server_->GetPort(),
-                                                 *client_call_manager_));
+  grpc_client_.reset(new GrpcClient<TestService>(
+      "127.0.0.1", grpc_server_->GetPort(), *client_call_manager_));
   // Freeze server first, it won't reply any request.
   test_service_handler_.frozen = true;
   // Send request.
@@ -195,7 +225,7 @@ TEST_F(TestGrpcServerClientFixture, TestClientCallManagerTimeout) {
   std::atomic<bool> call_timed_out(false);
   Ping(request, [&call_timed_out](const Status &status, const PingReply &reply) {
     RAY_LOG(INFO) << "Replied, status=" << status;
-    ASSERT_TRUE(status.IsIOError());
+    ASSERT_TRUE(status.IsTimedOut());
     call_timed_out = true;
   });
   // Wait for clinet call timed out.
@@ -216,10 +246,12 @@ TEST_F(TestGrpcServerClientFixture, TestClientDiedBeforeReply) {
   // Reinit ClientCallManager with short timeout, so that call won't block.
   grpc_client_.reset();
   client_call_manager_.reset();
-  client_call_manager_.reset(new ClientCallManager(client_io_service_, /*num_thread=*/1,
+  client_call_manager_.reset(new ClientCallManager(client_io_service_,
+                                                   ClusterID::Nil(),
+                                                   /*num_thread=*/1,
                                                    /*call_timeout_ms=*/100));
-  grpc_client_.reset(new GrpcClient<TestService>("127.0.0.1", grpc_server_->GetPort(),
-                                                 *client_call_manager_));
+  grpc_client_.reset(new GrpcClient<TestService>(
+      "127.0.0.1", grpc_server_->GetPort(), *client_call_manager_));
   // Freeze server first, it won't reply any request.
   test_service_handler_.frozen = true;
   // Send request.
@@ -227,7 +259,7 @@ TEST_F(TestGrpcServerClientFixture, TestClientDiedBeforeReply) {
   std::atomic<bool> call_timed_out(false);
   Ping(request, [&call_timed_out](const Status &status, const PingReply &reply) {
     RAY_LOG(INFO) << "Replied, status=" << status;
-    ASSERT_TRUE(status.IsIOError());
+    ASSERT_TRUE(status.IsTimedOut());
     call_timed_out = true;
   });
   // Wait for clinet call timed out. Client socket won't be closed until all calls are
@@ -245,9 +277,10 @@ TEST_F(TestGrpcServerClientFixture, TestClientDiedBeforeReply) {
     std::this_thread::sleep_for(std::chrono::milliseconds(1000));
   }
   // Reinit client with infinite timeout.
-  client_call_manager_.reset(new ClientCallManager(client_io_service_));
-  grpc_client_.reset(new GrpcClient<TestService>("127.0.0.1", grpc_server_->GetPort(),
-                                                 *client_call_manager_));
+  client_call_manager_.reset(
+      new ClientCallManager(client_io_service_, ClusterID::FromRandom()));
+  grpc_client_.reset(new GrpcClient<TestService>(
+      "127.0.0.1", grpc_server_->GetPort(), *client_call_manager_));
   // Send again, this request should be replied. If any leaking happened, this call won't
   // be replied to since the max_active_rpcs is 1.
   std::atomic<bool> done(false);
@@ -257,6 +290,30 @@ TEST_F(TestGrpcServerClientFixture, TestClientDiedBeforeReply) {
   });
   while (!done) {
     RAY_LOG(INFO) << "waiting";
+    std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+  }
+}
+
+TEST_F(TestGrpcServerClientFixture, TestTimeoutMacro) {
+  // Make sure the timeout value in the macro works as expected.
+  test_service_handler_.frozen = true;
+  // Send request.
+  PingTimeoutRequest request;
+  std::atomic<bool> call_timed_out(false);
+  PingTimeout(request,
+              [&call_timed_out](const Status &status, const PingTimeoutReply &reply) {
+                RAY_LOG(INFO) << "Replied, status=" << status;
+                ASSERT_TRUE(status.IsTimedOut());
+                call_timed_out = true;
+              });
+  // Wait for clinet call timed out.
+  while (!call_timed_out) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+  }
+  // Unfreeze server so the server thread can exit.
+  test_service_handler_.frozen = false;
+  while (test_service_handler_.reply_failure_count <= 0) {
+    RAY_LOG(INFO) << "Waiting for reply failure";
     std::this_thread::sleep_for(std::chrono::milliseconds(1000));
   }
 }

@@ -15,9 +15,10 @@
 #pragma once
 
 #include <ray/api/common_types.h>
-#include <ray/api/function_manager.h>
+#include <ray/api/ray_runtime_holder.h>
 
 #include <boost/dll.hpp>
+#include <filesystem>
 #include <memory>
 #include <msgpack.hpp>
 #include <string>
@@ -41,7 +42,7 @@ class FunctionHelper {
     return *instance;
   }
 
-  void LoadDll(const boost::filesystem::path &lib_path);
+  void LoadDll(const std::filesystem::path &lib_path);
   void LoadFunctionsFromPaths(const std::vector<std::string> &paths);
   const EntryFuntion &GetExecutableFunctions(const std::string &function_name);
   const EntryFuntion &GetExecutableMemberFunctions(const std::string &function_name);

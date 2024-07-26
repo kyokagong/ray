@@ -26,11 +26,13 @@
 #include "src/ray/protobuf/gcs_service.pb.h"
 
 namespace ray {
-
 namespace gcs {
 
-using SubscribeOperation = std::function<Status(const StatusCallback &done)>;
+// Default GCS Client timeout in milliseconds, as defined in
+// RAY_gcs_server_request_timeout_seconds
+int64_t GetGcsTimeoutMs();
 
+using SubscribeOperation = std::function<Status(const StatusCallback &done)>;
 using FetchDataOperation = std::function<void(const StatusCallback &done)>;
 
 class GcsClient;
@@ -54,37 +56,86 @@ class ActorInfoAccessor {
 
   /// Get all actor specification from the GCS asynchronously.
   ///
+  /// \param  actor_id To filter actors by actor_id.
+  /// \param  job_id To filter actors by job_id.
+  /// \param  actor_state_name To filter actors based on actor state.
   /// \param callback Callback that will be called after lookup finishes.
   /// \return Status
-  virtual Status AsyncGetAll(const MultiItemCallback<rpc::ActorTableData> &callback);
+  virtual Status AsyncGetAllByFilter(
+      const std::optional<ActorID> &actor_id,
+      const std::optional<JobID> &job_id,
+      const std::optional<std::string> &actor_state_name,
+      const MultiItemCallback<rpc::ActorTableData> &callback);
 
   /// Get actor specification for a named actor from the GCS asynchronously.
   ///
   /// \param name The name of the detached actor to look up in the GCS.
   /// \param ray_namespace The namespace to filter to.
   /// \param callback Callback that will be called after lookup finishes.
+  /// \param timeout_ms RPC timeout in milliseconds. -1 means the default.
   /// \return Status
-  virtual Status AsyncGetByName(
-      const std::string &name, const std::string &ray_namespace,
-      const OptionalItemCallback<rpc::ActorTableData> &callback);
+  virtual Status AsyncGetByName(const std::string &name,
+                                const std::string &ray_namespace,
+                                const OptionalItemCallback<rpc::ActorTableData> &callback,
+                                int64_t timeout_ms = -1);
+
+  /// Get actor specification for a named actor from the GCS synchronously.
+  ///
+  /// The RPC will timeout after the default GCS RPC timeout is exceeded.
+  ///
+  /// \param name The name of the detached actor to look up in the GCS.
+  /// \param ray_namespace The namespace to filter to.
+  /// \return Status. TimedOut status if RPC is timed out.
+  /// NotFound if the name doesn't exist.
+  virtual Status SyncGetByName(const std::string &name,
+                               const std::string &ray_namespace,
+                               rpc::ActorTableData &actor_table_data,
+                               rpc::TaskSpec &task_spec);
 
   /// List all named actors from the GCS asynchronously.
   ///
   /// \param all_namespaces Whether or not to include actors from all Ray namespaces.
   /// \param ray_namespace The namespace to filter to if all_namespaces is false.
   /// \param callback Callback that will be called after lookup finishes.
+  /// \param timeout_ms The RPC timeout in milliseconds. -1 means the default.
   /// \return Status
   virtual Status AsyncListNamedActors(
-      bool all_namespaces, const std::string &ray_namespace,
-      const ItemCallback<std::vector<rpc::NamedActorInfo>> &callback);
+      bool all_namespaces,
+      const std::string &ray_namespace,
+      const OptionalItemCallback<std::vector<rpc::NamedActorInfo>> &callback,
+      int64_t timeout_ms = -1);
+
+  /// List all named actors from the GCS synchronously.
+  ///
+  /// The RPC will timeout after the default GCS RPC timeout is exceeded.
+  ///
+  /// \param all_namespaces Whether or not to include actors from all Ray namespaces.
+  /// \param ray_namespace The namespace to filter to if all_namespaces is false.
+  /// \param[out] actors The pair of list of named actors. Each pair includes the
+  /// namespace and name of the actor. \return Status. TimeOut if RPC times out.
+  virtual Status SyncListNamedActors(
+      bool all_namespaces,
+      const std::string &ray_namespace,
+      std::vector<std::pair<std::string, std::string>> &actors);
 
   /// Register actor to GCS asynchronously.
   ///
   /// \param task_spec The specification for the actor creation task.
   /// \param callback Callback that will be called after the actor info is written to GCS.
+  /// \param timeout_ms RPC timeout ms. -1 means there's no timeout.
   /// \return Status
   virtual Status AsyncRegisterActor(const TaskSpecification &task_spec,
-                                    const StatusCallback &callback);
+                                    const StatusCallback &callback,
+                                    int64_t timeout_ms = -1);
+
+  /// Register actor to GCS synchronously.
+  ///
+  /// The RPC will timeout after the default GCS RPC timeout is exceeded.
+  ///
+  /// \param task_spec The specification for the actor creation task.
+  /// \return Status. Timedout if actor is not registered by the global
+  /// GCS timeout.
+  virtual Status SyncRegisterActor(const ray::TaskSpecification &task_spec);
 
   /// Kill actor via GCS asynchronously.
   ///
@@ -93,7 +144,9 @@ class ActorInfoAccessor {
   /// \param no_restart If set to true, the killed actor will not be restarted anymore.
   /// \param callback Callback that will be called after the actor is destroyed.
   /// \return Status
-  virtual Status AsyncKillActor(const ActorID &actor_id, bool force_kill, bool no_restart,
+  virtual Status AsyncKillActor(const ActorID &actor_id,
+                                bool force_kill,
+                                bool no_restart,
                                 const StatusCallback &callback);
 
   /// Asynchronously request GCS to create the actor.
@@ -132,9 +185,7 @@ class ActorInfoAccessor {
   /// PubSub server restart will cause GCS server restart. In this case, we need to
   /// resubscribe from PubSub server, otherwise we only need to fetch data from GCS
   /// server.
-  ///
-  /// \param is_pubsub_server_restarted Whether pubsub server is restarted.
-  virtual void AsyncResubscribe(bool is_pubsub_server_restarted);
+  virtual void AsyncResubscribe();
 
   /// Check if the specified actor is unsubscribed.
   ///
@@ -147,12 +198,12 @@ class ActorInfoAccessor {
   absl::Mutex mutex_;
 
   /// Resubscribe operations for actors.
-  std::unordered_map<ActorID, SubscribeOperation> resubscribe_operations_
-      GUARDED_BY(mutex_);
+  absl::flat_hash_map<ActorID, SubscribeOperation> resubscribe_operations_
+      ABSL_GUARDED_BY(mutex_);
 
   /// Save the fetch data operation of actors.
-  std::unordered_map<ActorID, FetchDataOperation> fetch_data_operations_
-      GUARDED_BY(mutex_);
+  absl::flat_hash_map<ActorID, FetchDataOperation> fetch_data_operations_
+      ABSL_GUARDED_BY(mutex_);
 
   GcsClient *client_impl_;
 };
@@ -195,16 +246,23 @@ class JobInfoAccessor {
   ///
   /// \param callback Callback that will be called after lookup finished.
   /// \return Status
-  virtual Status AsyncGetAll(const MultiItemCallback<rpc::JobTableData> &callback);
+  virtual Status AsyncGetAll(const MultiItemCallback<rpc::JobTableData> &callback,
+                             int64_t timeout_ms);
+
+  /// Get all job info from GCS synchronously.
+  ///
+  /// \param timeout_ms -1 means infinite.
+  /// \param[out] job_data_list The list of job data retrieved from GCS.
+  /// \return Status
+  virtual Status GetAll(std::vector<rpc::JobTableData> &job_data_list,
+                        int64_t timeout_ms);
 
   /// Reestablish subscription.
   /// This should be called when GCS server restarts from a failure.
   /// PubSub server restart will cause GCS server restart. In this case, we need to
   /// resubscribe from PubSub server, otherwise we only need to fetch data from GCS
   /// server.
-  ///
-  /// \param is_pubsub_server_restarted Whether pubsub server is restarted.
-  virtual void AsyncResubscribe(bool is_pubsub_server_restarted);
+  virtual void AsyncResubscribe();
 
   /// Increment and get next job id. This is not idempotent.
   ///
@@ -220,104 +278,6 @@ class JobInfoAccessor {
   /// Save the subscribe operation in this function, so we can call it again when PubSub
   /// server restarts from a failure.
   SubscribeOperation subscribe_operation_;
-
-  GcsClient *client_impl_;
-};
-
-/// \class TaskInfoAccessor
-/// `TaskInfoAccessor` is a sub-interface of `GcsClient`.
-/// This class includes all the methods that are related to accessing
-/// task information in the GCS.
-class TaskInfoAccessor {
- public:
-  TaskInfoAccessor() = default;
-  explicit TaskInfoAccessor(GcsClient *client_impl);
-  virtual ~TaskInfoAccessor() = default;
-  /// Add a task to GCS asynchronously.
-  ///
-  /// \param data_ptr The task that will be added to GCS.
-  /// \param callback Callback that will be called after task has been added
-  /// to GCS.
-  /// \return Status
-  virtual Status AsyncAdd(const std::shared_ptr<rpc::TaskTableData> &data_ptr,
-                          const StatusCallback &callback);
-
-  /// Get task information from GCS asynchronously.
-  ///
-  /// \param task_id The ID of the task to look up in GCS.
-  /// \param callback Callback that is called after lookup finished.
-  /// \return Status
-  virtual Status AsyncGet(const TaskID &task_id,
-                          const OptionalItemCallback<rpc::TaskTableData> &callback);
-
-  /// Add a task lease to GCS asynchronously.
-  ///
-  /// \param data_ptr The task lease that will be added to GCS.
-  /// \param callback Callback that will be called after task lease has been added
-  /// to GCS.
-  /// \return Status
-  virtual Status AsyncAddTaskLease(const std::shared_ptr<rpc::TaskLeaseData> &data_ptr,
-                                   const StatusCallback &callback);
-
-  /// Get task lease information from GCS asynchronously.
-  ///
-  /// \param task_id The ID of the task to look up in GCS.
-  /// \param callback Callback that is called after lookup finished.
-  /// \return Status
-  virtual Status AsyncGetTaskLease(
-      const TaskID &task_id, const OptionalItemCallback<rpc::TaskLeaseData> &callback);
-
-  /// Subscribe asynchronously to the event that the given task lease is added in GCS.
-  ///
-  /// \param task_id The ID of the task to be subscribed to.
-  /// \param subscribe Callback that will be called each time when the task lease is
-  /// updated or the task lease is empty currently.
-  /// \param done Callback that will be called when subscription is complete.
-  /// \return Status
-  virtual Status AsyncSubscribeTaskLease(
-      const TaskID &task_id,
-      const SubscribeCallback<TaskID, boost::optional<rpc::TaskLeaseData>> &subscribe,
-      const StatusCallback &done);
-
-  /// Cancel subscription to a task lease asynchronously.
-  ///
-  /// \param task_id The ID of the task to be unsubscribed to.
-  /// \return Status
-  virtual Status AsyncUnsubscribeTaskLease(const TaskID &task_id);
-
-  /// Attempt task reconstruction to GCS asynchronously.
-  ///
-  /// \param data_ptr The task reconstruction that will be added to GCS.
-  /// \param callback Callback that will be called after task reconstruction
-  /// has been added to GCS.
-  /// \return Status
-  virtual Status AttemptTaskReconstruction(
-      const std::shared_ptr<rpc::TaskReconstructionData> &data_ptr,
-      const StatusCallback &callback);
-
-  /// Reestablish subscription.
-  /// This should be called when GCS server restarts from a failure.
-  /// PubSub server restart will cause GCS server restart. In this case, we need to
-  /// resubscribe from PubSub server, otherwise we only need to fetch data from GCS
-  /// server.
-  ///
-  /// \param is_pubsub_server_restarted Whether pubsub server is restarted.
-  virtual void AsyncResubscribe(bool is_pubsub_server_restarted);
-
-  /// Check if the specified task lease is unsubscribed.
-  ///
-  /// \param task_id The ID of the task.
-  /// \return Whether the specified task lease is unsubscribed.
-  virtual bool IsTaskLeaseUnsubscribed(const TaskID &task_id);
-
- private:
-  /// Save the subscribe operations, so we can call them again when PubSub
-  /// server restarts from a failure.
-  std::unordered_map<TaskID, SubscribeOperation> subscribe_task_lease_operations_;
-
-  /// Save the fetch data operation in this function, so we can call it again when GCS
-  /// server restarts from a failure.
-  std::unordered_map<TaskID, FetchDataOperation> fetch_task_lease_data_operations_;
 
   GcsClient *client_impl_;
 };
@@ -339,13 +299,13 @@ class NodeInfoAccessor {
   virtual Status RegisterSelf(const rpc::GcsNodeInfo &local_node_info,
                               const StatusCallback &callback);
 
-  /// Drain (remove the information of the node from the cluster) the local node from GCS
-  /// synchronously.
+  /// Unregister local node to GCS asynchronously.
   ///
-  /// Once the RPC is replied, it is guaranteed that GCS drains the information of the
-  /// local node, and all the nodes in the cluster will "eventually" be informed that the
-  /// node is drained. \return Status
-  virtual Status DrainSelf();
+  /// \param node_death_info The death information regarding why to unregister from GCS.
+  /// \param unregister_done_callback Callback that will be called when unregistration is
+  /// done.
+  virtual void UnregisterSelf(const rpc::NodeDeathInfo &node_death_info,
+                              std::function<void()> unregister_done_callback);
 
   /// Get id of local node which was registered by 'RegisterSelf'.
   ///
@@ -365,6 +325,23 @@ class NodeInfoAccessor {
   virtual Status AsyncRegister(const rpc::GcsNodeInfo &node_info,
                                const StatusCallback &callback);
 
+  /// Send a check alive request to GCS for the liveness of this node.
+  ///
+  /// \param callback The callback function once the request is finished.
+  /// \param timeout_ms The timeout for this request.
+  /// \return Status
+  virtual Status AsyncCheckSelfAlive(const std::function<void(Status, bool)> &callback,
+                                     int64_t timeout_ms);
+
+  /// Send a check alive request to GCS for the liveness of some nodes.
+  ///
+  /// \param callback The callback function once the request is finished.
+  /// \param timeout_ms The timeout for this request.
+  /// \return Status
+  virtual Status AsyncCheckAlive(const std::vector<std::string> &raylet_addresses,
+                                 int64_t timeout_ms,
+                                 const MultiItemCallback<bool> &callback);
+
   /// Drain (remove the information of the node from the cluster) the local node from GCS
   /// asynchronously.
   ///
@@ -379,7 +356,8 @@ class NodeInfoAccessor {
   ///
   /// \param callback Callback that will be called after lookup finishes.
   /// \return Status
-  virtual Status AsyncGetAll(const MultiItemCallback<rpc::GcsNodeInfo> &callback);
+  virtual Status AsyncGetAll(const MultiItemCallback<rpc::GcsNodeInfo> &callback,
+                             int64_t timeout_ms);
 
   /// Subscribe to node addition and removal events from GCS and cache those information.
   ///
@@ -410,7 +388,35 @@ class NodeInfoAccessor {
   /// is called before.
   ///
   /// \return All nodes in cache.
-  virtual const std::unordered_map<NodeID, rpc::GcsNodeInfo> &GetAll() const;
+  virtual const absl::flat_hash_map<NodeID, rpc::GcsNodeInfo> &GetAll() const;
+
+  /// Get information of all nodes from an RPC to GCS synchronously.
+  ///
+  /// \return All nodes in cache.
+  virtual Status GetAllNoCache(int64_t timeout_ms, std::vector<rpc::GcsNodeInfo> &nodes);
+
+  /// Send a check alive request to GCS for the liveness of some nodes.
+  ///
+  /// \param raylet_addresses The addresses of the nodes to check, each like "ip:port".
+  /// \param timeout_ms The timeout for this request.
+  /// \param nodes_alive The liveness of the nodes. Only valid if the status is OK.
+  /// \return Status
+  virtual Status CheckAlive(const std::vector<std::string> &raylet_addresses,
+                            int64_t timeout_ms,
+                            std::vector<bool> &nodes_alive);
+
+  /// Drain (remove the information of the nodes from the cluster) the specified nodes
+  /// from GCS synchronously.
+  ///
+  /// Check gcs_service.proto NodeInfoGcsService.DrainNode for the API spec.
+  ///
+  /// \param node_ids The IDs of nodes to be unregistered.
+  /// \param timeout_ms The timeout for this request.
+  /// \param drained_node_ids The IDs of nodes that are drained.
+  /// \return Status
+  virtual Status DrainNodes(const std::vector<NodeID> &node_ids,
+                            int64_t timeout_ms,
+                            std::vector<std::string> &drained_node_ids);
 
   /// Search the local cache to find out if the given node is removed.
   /// Non-thread safe.
@@ -421,24 +427,12 @@ class NodeInfoAccessor {
   /// \return Whether the node is removed.
   virtual bool IsRemoved(const NodeID &node_id) const;
 
-  /// Report heartbeat of a node to GCS asynchronously.
-  ///
-  /// \param data_ptr The heartbeat that will be reported to GCS.
-  /// \param callback Callback that will be called after report finishes.
-  /// \return Status
-  virtual  // TODO(micafan) NodeStateAccessor will call this method to report heartbeat.
-      Status
-      AsyncReportHeartbeat(const std::shared_ptr<rpc::HeartbeatTableData> &data_ptr,
-                           const StatusCallback &callback);
-
   /// Reestablish subscription.
   /// This should be called when GCS server restarts from a failure.
   /// PubSub server restart will cause GCS server restart. In this case, we need to
   /// resubscribe from PubSub server, otherwise we only need to fetch data from GCS
   /// server.
-  ///
-  /// \param is_pubsub_server_restarted Whether pubsub server is restarted.
-  virtual void AsyncResubscribe(bool is_pubsub_server_restarted);
+  virtual void AsyncResubscribe();
 
   /// Get the internal config string from GCS.
   ///
@@ -446,6 +440,9 @@ class NodeInfoAccessor {
   /// \return Status
   virtual Status AsyncGetInternalConfig(
       const OptionalItemCallback<std::string> &callback);
+
+  /// Add a node to accessor cache.
+  virtual void HandleNotification(const rpc::GcsNodeInfo &node_info);
 
  private:
   /// Save the subscribe operation in this function, so we can call it again when PubSub
@@ -455,8 +452,6 @@ class NodeInfoAccessor {
   /// Save the fetch data operation in this function, so we can call it again when GCS
   /// server restarts from a failure.
   FetchDataOperation fetch_node_data_operation_;
-
-  void HandleNotification(const rpc::GcsNodeInfo &node_info);
 
   GcsClient *client_impl_;
 
@@ -470,7 +465,7 @@ class NodeInfoAccessor {
   NodeChangeCallback node_change_callback_{nullptr};
 
   /// A cache for information about all nodes.
-  std::unordered_map<NodeID, rpc::GcsNodeInfo> node_cache_;
+  absl::flat_hash_map<NodeID, rpc::GcsNodeInfo> node_cache_;
   /// The set of removed nodes.
   std::unordered_set<NodeID> removed_nodes_;
 };
@@ -484,17 +479,6 @@ class NodeResourceInfoAccessor {
   NodeResourceInfoAccessor() = default;
   explicit NodeResourceInfoAccessor(GcsClient *client_impl);
   virtual ~NodeResourceInfoAccessor() = default;
-  // TODO(micafan) Define ResourceMap in GCS proto.
-  typedef std::unordered_map<std::string, std::shared_ptr<rpc::ResourceTableData>>
-      ResourceMap;
-
-  /// Get node's resources from GCS asynchronously.
-  ///
-  /// \param node_id The ID of node to lookup dynamic resources.
-  /// \param callback Callback that will be called after lookup finishes.
-  /// \return Status
-  virtual Status AsyncGetResources(const NodeID &node_id,
-                                   const OptionalItemCallback<ResourceMap> &callback);
 
   /// Get available resources of all nodes from GCS asynchronously.
   ///
@@ -503,56 +487,26 @@ class NodeResourceInfoAccessor {
   virtual Status AsyncGetAllAvailableResources(
       const MultiItemCallback<rpc::AvailableResources> &callback);
 
-  /// Update resources of node in GCS asynchronously.
+  /// Get total resources of all nodes from GCS asynchronously.
   ///
-  /// \param node_id The ID of node to update dynamic resources.
-  /// \param resources The dynamic resources of node to be updated.
-  /// \param callback Callback that will be called after update finishes.
-  virtual Status AsyncUpdateResources(const NodeID &node_id, const ResourceMap &resources,
-                                      const StatusCallback &callback);
-
-  /// Delete resources of a node from GCS asynchronously.
-  ///
-  /// \param node_id The ID of node to delete resources from GCS.
-  /// \param resource_names The names of resource to be deleted.
-  /// \param callback Callback that will be called after delete finishes.
-  virtual Status AsyncDeleteResources(const NodeID &node_id,
-                                      const std::vector<std::string> &resource_names,
-                                      const StatusCallback &callback);
-
-  /// Subscribe to node resource changes.
-  ///
-  /// \param subscribe Callback that will be called when any resource is updated.
-  /// \param done Callback that will be called when subscription is complete.
+  /// \param callback Callback that will be called after lookup finishes.
   /// \return Status
-  virtual Status AsyncSubscribeToResources(
-      const ItemCallback<rpc::NodeResourceChange> &subscribe, const StatusCallback &done);
+  virtual Status AsyncGetAllTotalResources(
+      const MultiItemCallback<rpc::TotalResources> &callback);
+
+  /// Get draining nodes from GCS asynchronously.
+  ///
+  /// \param callback Callback that will be called after lookup finishes.
+  /// \return Status
+  virtual Status AsyncGetDrainingNodes(
+      const ItemCallback<std::unordered_map<NodeID, int64_t>> &callback);
 
   /// Reestablish subscription.
   /// This should be called when GCS server restarts from a failure.
   /// PubSub server restart will cause GCS server restart. In this case, we need to
   /// resubscribe from PubSub server, otherwise we only need to fetch data from GCS
   /// server.
-  ///
-  /// \param is_pubsub_server_restarted Whether pubsub server is restarted.
-  virtual void AsyncResubscribe(bool is_pubsub_server_restarted);
-
-  /// Report resource usage of a node to GCS asynchronously.
-  ///
-  /// \param data_ptr The data that will be reported to GCS.
-  /// \param callback Callback that will be called after report finishes.
-  /// \return Status
-  virtual Status AsyncReportResourceUsage(
-      const std::shared_ptr<rpc::ResourcesData> &data_ptr,
-      const StatusCallback &callback);
-
-  /// Resend resource usage when GCS restarts from a failure.
-  virtual void AsyncReReportResourceUsage();
-
-  /// Return resources in last report. Used by light heartbeat.
-  virtual const std::shared_ptr<SchedulingResources> &GetLastResourceUsage() {
-    return last_resource_usage_;
-  }
+  virtual void AsyncResubscribe();
 
   /// Get newest resource usage of all nodes from GCS asynchronously.
   ///
@@ -561,33 +515,15 @@ class NodeResourceInfoAccessor {
   virtual Status AsyncGetAllResourceUsage(
       const ItemCallback<rpc::ResourceUsageBatchData> &callback);
 
-  /// Subscribe batched state of all nodes from GCS.
+  /// Get newest resource usage of all nodes from GCS synchronously.
   ///
-  /// \param subscribe Callback that will be called each time when batch resource usage is
-  /// updated.
-  /// \param done Callback that will be called when subscription is complete.
+  /// \param timeout_ms -1 means infinite.
+  /// \param resource_usage_batch_data The resource usage of all nodes.
   /// \return Status
-  virtual Status AsyncSubscribeBatchedResourceUsage(
-      const ItemCallback<rpc::ResourceUsageBatchData> &subscribe,
-      const StatusCallback &done);
-
-  /// Fill resource fields with cached resources. Used by light resource usage report.
-  virtual void FillResourceUsageRequest(rpc::ReportResourceUsageRequest &resource_usage);
-
- protected:
-  /// Cache which stores resource usage in last report used to check if they are changed.
-  /// Used by light resource usage report.
-  std::shared_ptr<SchedulingResources> last_resource_usage_ =
-      std::make_shared<SchedulingResources>();
+  virtual Status GetAllResourceUsage(int64_t timeout_ms,
+                                     rpc::GetAllResourceUsageReply &reply);
 
  private:
-  // Mutex to protect the cached_resource_usage_ field.
-  absl::Mutex mutex_;
-
-  /// Save the resource usage data, so we can resend it again when GCS server restarts
-  /// from a failure.
-  rpc::ReportResourceUsageRequest cached_resource_usage_ GUARDED_BY(mutex_);
-
   /// Save the subscribe operation in this function, so we can call it again when PubSub
   /// server restarts from a failure.
   SubscribeOperation subscribe_resource_operation_;
@@ -625,29 +561,28 @@ class ErrorInfoAccessor {
   GcsClient *client_impl_;
 };
 
-/// \class StatsInfoAccessor
-/// `StatsInfoAccessor` is a sub-interface of `GcsClient`.
+/// \class TaskInfoAccessor
+/// `TaskInfoAccessor` is a sub-interface of `GcsClient`.
 /// This class includes all the methods that are related to accessing
-/// stats in the GCS.
-class StatsInfoAccessor {
+/// task info in the GCS.
+class TaskInfoAccessor {
  public:
-  StatsInfoAccessor() = default;
-  explicit StatsInfoAccessor(GcsClient *client_impl);
-  virtual ~StatsInfoAccessor() = default;
-  /// Add profile data to GCS asynchronously.
+  TaskInfoAccessor() = default;
+  explicit TaskInfoAccessor(GcsClient *client_impl) : client_impl_(client_impl) {}
+  virtual ~TaskInfoAccessor() = default;
+  /// Add task event data to GCS asynchronously.
   ///
-  /// \param data_ptr The profile data that will be added to GCS.
+  /// \param data_ptr The task states event data that will be added to GCS.
   /// \param callback Callback that will be called when add is complete.
   /// \return Status
-  virtual Status AsyncAddProfileData(
-      const std::shared_ptr<rpc::ProfileTableData> &data_ptr,
-      const StatusCallback &callback);
+  virtual Status AsyncAddTaskEventData(std::unique_ptr<rpc::TaskEventData> data_ptr,
+                                       StatusCallback callback);
 
-  /// Get all profile info from GCS asynchronously.
+  /// Get all info/events of all tasks stored in GCS asynchronously.
   ///
-  /// \param callback Callback that will be called after lookup finished.
+  /// \param callback Callback that will be called after lookup finishes.
   /// \return Status
-  virtual Status AsyncGetAll(const MultiItemCallback<rpc::ProfileTableData> &callback);
+  virtual Status AsyncGetTaskEvents(const MultiItemCallback<rpc::TaskEvents> &callback);
 
  private:
   GcsClient *client_impl_;
@@ -704,14 +639,31 @@ class WorkerInfoAccessor {
   virtual Status AsyncAdd(const std::shared_ptr<rpc::WorkerTableData> &data_ptr,
                           const StatusCallback &callback);
 
+  /// Update the worker debugger port in GCS asynchronously.
+  ///
+  /// \param worker_id The ID of worker to update in the GCS.
+  /// \param debugger_port The debugger port of worker to update in the GCS.
+  /// \param callback Callback that will be called after update finishes.
+  /// \return Status
+  virtual Status AsyncUpdateDebuggerPort(const WorkerID &worker_id,
+                                         uint32_t debugger_port,
+                                         const StatusCallback &callback);
+
+  /// Update the number of worker's paused threads in GCS asynchronously.
+  ///
+  /// \param worker_id The ID of worker to update in the GCS.
+  /// \param num_paused_threads_delta The number of paused threads to update in the GCS.
+  /// \param callback Callback that will be called after update finishes.
+  /// \return Status
+  virtual Status AsyncUpdateWorkerNumPausedThreads(const WorkerID &worker_id,
+                                                   int num_paused_threads_delta,
+                                                   const StatusCallback &callback);
   /// Reestablish subscription.
   /// This should be called when GCS server restarts from a failure.
   /// PubSub server restart will cause GCS server restart. In this case, we need to
   /// resubscribe from PubSub server, otherwise we only need to fetch data from GCS
   /// server.
-  ///
-  /// \param is_pubsub_server_restarted Whether pubsub server is restarted.
-  virtual void AsyncResubscribe(bool is_pubsub_server_restarted);
+  virtual void AsyncResubscribe();
 
  private:
   /// Save the subscribe operation in this function, so we can call it again when GCS
@@ -726,15 +678,16 @@ class PlacementGroupInfoAccessor {
   PlacementGroupInfoAccessor() = default;
   explicit PlacementGroupInfoAccessor(GcsClient *client_impl);
   virtual ~PlacementGroupInfoAccessor() = default;
-  /// Create a placement group to GCS asynchronously.
+
+  /// Create a placement group to GCS synchronously.
+  ///
+  /// The RPC will timeout after the default GCS RPC timeout is exceeded.
   ///
   /// \param placement_group_spec The specification for the placement group creation task.
-  /// \param callback Callback that will be called after the placement group info is
-  /// written to GCS.
-  /// \return Status.
-  virtual Status AsyncCreatePlacementGroup(
-      const PlacementGroupSpecification &placement_group_spec,
-      const StatusCallback &callback);
+  /// \return Status. The status of the RPC. TimedOut if the RPC times out. Invalid if the
+  /// same name placement group is registered. NotFound if the placement group is removed.
+  virtual Status SyncCreatePlacementGroup(
+      const ray::PlacementGroupSpecification &placement_group_spec);
 
   /// Get a placement group data from GCS asynchronously by id.
   ///
@@ -747,10 +700,15 @@ class PlacementGroupInfoAccessor {
   /// Get a placement group data from GCS asynchronously by name.
   ///
   /// \param placement_group_name The name of a placement group to obtain from GCS.
+  /// \param ray_namespace The ray namespace.
+  /// \param callback The callback that's called when the RPC is replied.
+  /// \param timeout_ms The RPC timeout in milliseconds. -1 means the default.
   /// \return Status.
   virtual Status AsyncGetByName(
-      const std::string &placement_group_name, const std::string &ray_namespace,
-      const OptionalItemCallback<rpc::PlacementGroupTableData> &callback);
+      const std::string &placement_group_name,
+      const std::string &ray_namespace,
+      const OptionalItemCallback<rpc::PlacementGroupTableData> &callback,
+      int64_t timeout_ms = -1);
 
   /// Get all placement group info from GCS asynchronously.
   ///
@@ -759,22 +717,24 @@ class PlacementGroupInfoAccessor {
   virtual Status AsyncGetAll(
       const MultiItemCallback<rpc::PlacementGroupTableData> &callback);
 
-  /// Remove a placement group to GCS asynchronously.
+  /// Remove a placement group to GCS synchronously.
+  ///
+  /// The RPC will timeout after the default GCS RPC timeout is exceeded.
   ///
   /// \param placement_group_id The id for the placement group to remove.
-  /// \param callback Callback that will be called after the placement group is
-  /// removed from GCS.
   /// \return Status
-  virtual Status AsyncRemovePlacementGroup(const PlacementGroupID &placement_group_id,
-                                           const StatusCallback &callback);
+  virtual Status SyncRemovePlacementGroup(const PlacementGroupID &placement_group_id);
 
   /// Wait for a placement group until ready asynchronously.
   ///
+  /// The RPC will timeout after the default GCS RPC timeout is exceeded.
+  ///
   /// \param placement_group_id The id for the placement group to wait for until ready.
-  /// \param callback Callback that will be called after the placement group is created.
-  /// \return Status
-  virtual Status AsyncWaitUntilReady(const PlacementGroupID &placement_group_id,
-                                     const StatusCallback &callback);
+  /// \param timeout_seconds The timeout in seconds.
+  /// \return Status. TimedOut if the RPC times out. NotFound if the placement has already
+  /// removed.
+  virtual Status SyncWaitUntilReady(const PlacementGroupID &placement_group_id,
+                                    int64_t timeout_seconds);
 
  private:
   GcsClient *client_impl_;
@@ -787,87 +747,227 @@ class InternalKVAccessor {
   virtual ~InternalKVAccessor() = default;
   /// Asynchronously list keys with prefix stored in internal kv
   ///
+  /// \param ns The namespace to scan.
   /// \param prefix The prefix to scan.
+  /// \param timeout_ms -1 means infinite.
   /// \param callback Callback that will be called after scanning.
   /// \return Status
   virtual Status AsyncInternalKVKeys(
+      const std::string &ns,
       const std::string &prefix,
+      const int64_t timeout_ms,
       const OptionalItemCallback<std::vector<std::string>> &callback);
 
   /// Asynchronously get the value for a given key.
   ///
+  /// \param ns The namespace to lookup.
   /// \param key The key to lookup.
+  /// \param timeout_ms -1 means infinite.
   /// \param callback Callback that will be called after get the value.
-  virtual Status AsyncInternalKVGet(const std::string &key,
+  virtual Status AsyncInternalKVGet(const std::string &ns,
+                                    const std::string &key,
+                                    const int64_t timeout_ms,
                                     const OptionalItemCallback<std::string> &callback);
+
+  /// Asynchronously get the value for multiple keys.
+  ///
+  /// \param ns The namespace to lookup.
+  /// \param keys The keys to lookup.
+  /// \param timeout_ms -1 means infinite.
+  /// \param callback Callback that will be called after get the values.
+  virtual Status AsyncInternalKVMultiGet(
+      const std::string &ns,
+      const std::vector<std::string> &keys,
+      const int64_t timeout_ms,
+      const OptionalItemCallback<std::unordered_map<std::string, std::string>> &callback);
 
   /// Asynchronously set the value for a given key.
   ///
+  /// \param ns The namespace to put the key.
   /// \param key The key in <key, value> pair
   /// \param value The value associated with the key
+  /// \param timeout_ms -1 means infinite.
   /// \param callback Callback that will be called after the operation.
   /// \return Status
-  virtual Status AsyncInternalKVPut(const std::string &key, const std::string &value,
+  virtual Status AsyncInternalKVPut(const std::string &ns,
+                                    const std::string &key,
+                                    const std::string &value,
                                     bool overwrite,
+                                    const int64_t timeout_ms,
                                     const OptionalItemCallback<int> &callback);
 
   /// Asynchronously check the existence of a given key
   ///
-  /// \param key The key to check
-  /// \param callback Callback that will be called after the operation.
+  /// \param ns The namespace to check.
+  /// \param key The key to check.
+  /// \param timeout_ms -1 means infinite.
+  /// \param callback Callback that will be called after the operation. Called with `true`
+  /// if the key is deleted; `false` if it doesn't exist.
   /// \return Status
-  virtual Status AsyncInternalKVExists(const std::string &key,
+  virtual Status AsyncInternalKVExists(const std::string &ns,
+                                       const std::string &key,
+                                       const int64_t timeout_ms,
                                        const OptionalItemCallback<bool> &callback);
 
   /// Asynchronously delete a key
   ///
-  /// \param key The key to delete
-  /// \param callback Callback that will be called after the operation.
+  /// \param ns The namespace to delete from.
+  /// \param key The key to delete.
+  /// \param del_by_prefix If set to be true, delete all keys with prefix as `key`.
+  /// \param timeout_ms -1 means infinite.
+  /// \param callback Callback that will be called after the operation. Called with number
+  /// of keys deleted.
   /// \return Status
-  virtual Status AsyncInternalKVDel(const std::string &key,
-                                    const StatusCallback &callback);
+  virtual Status AsyncInternalKVDel(const std::string &ns,
+                                    const std::string &key,
+                                    bool del_by_prefix,
+                                    const int64_t timeout_ms,
+                                    const OptionalItemCallback<int> &callback);
 
   // These are sync functions of the async above
 
   /// List keys with prefix stored in internal kv
   ///
+  /// The RPC will timeout after the timeout_ms, or wait infinitely if timeout_ms is -1.
+  ///
+  /// \param ns The namespace to scan.
   /// \param prefix The prefix to scan.
+  /// \param timeout_ms -1 means infinite.
   /// \param value It's an output parameter. It'll be set to the keys with `prefix`
   /// \return Status
-  virtual Status Keys(const std::string &prefix, std::vector<std::string> &value);
+  virtual Status Keys(const std::string &ns,
+                      const std::string &prefix,
+                      const int64_t timeout_ms,
+                      std::vector<std::string> &value);
 
   /// Set the <key, value> in the store
   ///
+  /// The RPC will timeout after the timeout_ms, or wait infinitely if timeout_ms is -1.
+  ///
+  /// \param ns The namespace to put the key.
   /// \param key The key of the pair
   /// \param value The value of the pair
   /// \param overwrite If it's true, it'll overwrite existing <key, value> if it
   ///     exists.
+  /// \param timeout_ms -1 means infinite.
   /// \param added It's an output parameter. It'll be set to be true if
   ///     any row is added.
   /// \return Status
-  virtual Status Put(const std::string &key, const std::string &value, bool overwrite,
+  virtual Status Put(const std::string &ns,
+                     const std::string &key,
+                     const std::string &value,
+                     bool overwrite,
+                     const int64_t timeout_ms,
                      bool &added);
 
   /// Retrive the value associated with a key
   ///
-  /// \param key The key to lookup
+  /// The RPC will timeout after the timeout_ms, or wait infinitely if timeout_ms is -1.
+  ///
+  /// \param ns The namespace to lookup.
+  /// \param key The key to lookup.
+  /// \param timeout_ms -1 means infinite.
   /// \param value It's an output parameter. It'll be set to the value of the key
   /// \return Status
-  virtual Status Get(const std::string &key, std::string &value);
+  virtual Status Get(const std::string &ns,
+                     const std::string &key,
+                     const int64_t timeout_ms,
+                     std::string &value);
+
+  /// Retrive the values associated with some keys
+  ///
+  /// \param ns The namespace to lookup.
+  /// \param keys The keys to lookup.
+  /// \param timeout_ms -1 means infinite.
+  /// \param values It's an output parameter. It'll be set to the values of the keys.
+  virtual Status MultiGet(const std::string &ns,
+                          const std::vector<std::string> &keys,
+                          const int64_t timeout_ms,
+                          std::unordered_map<std::string, std::string> &values);
 
   /// Delete the key
   ///
+  /// The RPC will timeout after the timeout_ms, or wait infinitely if timeout_ms is -1.
+  ///
+  /// \param ns The namespace to delete from.
   /// \param key The key to delete
+  /// \param del_by_prefix If set to be true, delete all keys with prefix as `key`.
+  /// \param timeout_ms -1 means infinite.
+  /// \param deleted It's an output parameter. It'll be set to be number of keys deleted.
   /// \return Status
-  virtual Status Del(const std::string &key);
+  virtual Status Del(const std::string &ns,
+                     const std::string &key,
+                     bool del_by_prefix,
+                     const int64_t timeout_ms,
+                     int &num_deleted);
 
   /// Check existence of a key in the store
   ///
+  /// The RPC will timeout after the timeout_ms, or wait infinitely if timeout_ms is -1.
+  ///
+  /// \param ns The namespace to check.
   /// \param key The key to check
+  /// \param timeout_ms -1 means infinite.
   /// \param exist It's an output parameter. It'll be true if the key exists in the
   ///    system. Otherwise, it'll be set to be false.
   /// \return Status
-  virtual Status Exists(const std::string &key, bool &exist);
+  virtual Status Exists(const std::string &ns,
+                        const std::string &key,
+                        const int64_t timeout_ms,
+                        bool &exists);
+
+ private:
+  GcsClient *client_impl_;
+};
+
+class RuntimeEnvAccessor {
+ public:
+  RuntimeEnvAccessor() = default;
+  explicit RuntimeEnvAccessor(GcsClient *client_impl);
+  virtual ~RuntimeEnvAccessor() = default;
+
+  /// Pins a runtime environment by URI.
+  ///
+  /// Only works if URI has prefix "gcs://", for which GCS holds a reference for
+  /// `expiration_s` seconds. After that, GCS decrements the reference count.
+  ///
+  /// For all other URIs, this call is a no-op and returns OK.
+  Status PinRuntimeEnvUri(const std::string &uri, int expiration_s, int64_t timeout_ms);
+
+ private:
+  GcsClient *client_impl_;
+};
+
+/// \class AutoscalerStateAccessor
+/// `AutoscalerStateAccessor` is a sub-interface of `GcsClient`.
+/// This class includes all the methods that are related to accessing
+/// autoscaler state information in the GCS.
+class AutoscalerStateAccessor {
+ public:
+  AutoscalerStateAccessor() = default;
+  explicit AutoscalerStateAccessor(GcsClient *client_impl);
+  virtual ~AutoscalerStateAccessor() = default;
+
+  virtual Status RequestClusterResourceConstraint(
+      int64_t timeout_ms,
+      const std::vector<std::unordered_map<std::string, double>> &bundles,
+      const std::vector<int64_t> &count_array);
+
+  virtual Status GetClusterResourceState(int64_t timeout_ms,
+                                         std::string &serialized_reply);
+
+  virtual Status GetClusterStatus(int64_t timeout_ms, std::string &serialized_reply);
+
+  virtual Status ReportAutoscalingState(int64_t timeout_ms,
+                                        const std::string &serialized_state);
+
+  virtual Status DrainNode(const std::string &node_id,
+                           int32_t reason,
+                           const std::string &reason_message,
+                           int64_t deadline_timestamp_ms,
+                           int64_t timeout_ms,
+                           bool &is_accepted,
+                           std::string &rejection_reason_message);
 
  private:
   GcsClient *client_impl_;

@@ -17,483 +17,17 @@
 #include <thread>
 
 #include "ray/common/task/task.h"
+#include "ray/gcs/pb_util.h"
 
 using ray::rpc::ActorTableData;
+using namespace ray::gcs;
 
 namespace ray {
 namespace core {
 
-void CoreWorkerDirectActorTaskSubmitter::AddActorQueueIfNotExists(
-    const ActorID &actor_id) {
-  absl::MutexLock lock(&mu_);
-  // No need to check whether the insert was successful, since it is possible
-  // for this worker to have multiple references to the same actor.
-  client_queues_.emplace(actor_id, ClientQueue());
-}
-
-void CoreWorkerDirectActorTaskSubmitter::KillActor(const ActorID &actor_id,
-                                                   bool force_kill, bool no_restart) {
-  absl::MutexLock lock(&mu_);
-  rpc::KillActorRequest request;
-  request.set_intended_actor_id(actor_id.Binary());
-  request.set_force_kill(force_kill);
-  request.set_no_restart(no_restart);
-
-  auto it = client_queues_.find(actor_id);
-  // The language frontend can only kill actors that it has a reference to.
-  RAY_CHECK(it != client_queues_.end());
-
-  if (!it->second.pending_force_kill) {
-    it->second.pending_force_kill = request;
-  } else if (force_kill) {
-    // Overwrite the previous request to kill the actor if the new request is a
-    // force kill.
-    it->second.pending_force_kill->set_force_kill(true);
-    if (no_restart) {
-      // Overwrite the previous request to disable restart if the new request's
-      // no_restart flag is set to true.
-      it->second.pending_force_kill->set_no_restart(true);
-    }
-  }
-
-  SendPendingTasks(actor_id);
-}
-
-Status CoreWorkerDirectActorTaskSubmitter::SubmitTask(TaskSpecification task_spec) {
-  auto task_id = task_spec.TaskId();
-  auto actor_id = task_spec.ActorId();
-  RAY_LOG(DEBUG) << "Submitting task " << task_id;
-  RAY_CHECK(task_spec.IsActorTask());
-
-  bool task_queued = false;
-  uint64_t send_pos = 0;
-  {
-    absl::MutexLock lock(&mu_);
-    auto queue = client_queues_.find(actor_id);
-    RAY_CHECK(queue != client_queues_.end());
-    if (queue->second.state != rpc::ActorTableData::DEAD) {
-      // We must fix the send order prior to resolving dependencies, which may
-      // complete out of order. This ensures that we will not deadlock due to
-      // backpressure. The receiving actor will execute the tasks according to
-      // this sequence number.
-      send_pos = task_spec.ActorCounter();
-      auto inserted =
-          queue->second.requests.emplace(send_pos, std::make_pair(task_spec, false));
-      RAY_CHECK(inserted.second);
-      task_queued = true;
-    }
-  }
-
-  if (task_queued) {
-    // We must release the lock before resolving the task dependencies since
-    // the callback may get called in the same call stack.
-    resolver_.ResolveDependencies(task_spec, [this, send_pos, actor_id](Status status) {
-      absl::MutexLock lock(&mu_);
-      auto queue = client_queues_.find(actor_id);
-      RAY_CHECK(queue != client_queues_.end());
-      auto it = queue->second.requests.find(send_pos);
-      // Only dispatch tasks if the submitted task is still queued. The task
-      // may have been dequeued if the actor has since failed.
-      if (it != queue->second.requests.end()) {
-        if (status.ok()) {
-          it->second.second = true;
-          SendPendingTasks(actor_id);
-        } else {
-          auto task_id = it->second.first.TaskId();
-          queue->second.requests.erase(it);
-          task_finisher_.PendingTaskFailed(
-              task_id, rpc::ErrorType::DEPENDENCY_RESOLUTION_FAILED, &status);
-        }
-      }
-    });
-  } else {
-    // Do not hold the lock while calling into task_finisher_.
-    task_finisher_.MarkTaskCanceled(task_id);
-    std::shared_ptr<rpc::RayException> creation_task_exception = nullptr;
-    {
-      absl::MutexLock lock(&mu_);
-      auto queue = client_queues_.find(task_spec.ActorId());
-      creation_task_exception = queue->second.creation_task_exception;
-    }
-    auto status = Status::IOError("cancelling task of dead actor");
-    // No need to increment the number of completed tasks since the actor is
-    // dead.
-    RAY_UNUSED(!task_finisher_.PendingTaskFailed(task_id, rpc::ErrorType::ACTOR_DIED,
-                                                 &status, creation_task_exception));
-  }
-
-  // If the task submission subsequently fails, then the client will receive
-  // the error in a callback.
-  return Status::OK();
-}
-
-void CoreWorkerDirectActorTaskSubmitter::DisconnectRpcClient(ClientQueue &queue) {
-  queue.rpc_client = nullptr;
-  core_worker_client_pool_.Disconnect(WorkerID::FromBinary(queue.worker_id));
-  queue.worker_id.clear();
-  queue.pending_force_kill.reset();
-}
-
-void CoreWorkerDirectActorTaskSubmitter::FailInflightTasks(
-    const std::unordered_map<TaskID, rpc::ClientCallback<rpc::PushTaskReply>>
-        &inflight_task_callbacks) {
-  // NOTE(kfstorm): We invoke the callbacks with a bad status to act like there's a
-  // network issue. We don't call `task_finisher_.PendingTaskFailed` directly because
-  // there's much more work to do in the callback.
-  auto status = Status::IOError("Fail all inflight tasks due to actor state change.");
-  rpc::PushTaskReply reply;
-  for (const auto &entry : inflight_task_callbacks) {
-    entry.second(status, reply);
-  }
-}
-
-void CoreWorkerDirectActorTaskSubmitter::ConnectActor(const ActorID &actor_id,
-                                                      const rpc::Address &address,
-                                                      int64_t num_restarts) {
-  RAY_LOG(DEBUG) << "Connecting to actor " << actor_id << " at worker "
-                 << WorkerID::FromBinary(address.worker_id());
-
-  std::unordered_map<TaskID, rpc::ClientCallback<rpc::PushTaskReply>>
-      inflight_task_callbacks;
-
-  {
-    absl::MutexLock lock(&mu_);
-
-    auto queue = client_queues_.find(actor_id);
-    RAY_CHECK(queue != client_queues_.end());
-    if (num_restarts < queue->second.num_restarts) {
-      // This message is about an old version of the actor and the actor has
-      // already restarted since then. Skip the connection.
-      RAY_LOG(INFO) << "Skip actor connection that has already been restarted, actor_id="
-                    << actor_id;
-      return;
-    }
-
-    if (queue->second.rpc_client &&
-        queue->second.rpc_client->Addr().ip_address() == address.ip_address() &&
-        queue->second.rpc_client->Addr().port() == address.port()) {
-      RAY_LOG(DEBUG) << "Skip actor that has already been connected, actor_id="
-                     << actor_id;
-      return;
-    }
-
-    if (queue->second.state == rpc::ActorTableData::DEAD) {
-      // This message is about an old version of the actor and the actor has
-      // already died since then. Skip the connection.
-      return;
-    }
-
-    queue->second.num_restarts = num_restarts;
-    if (queue->second.rpc_client) {
-      // Clear the client to the old version of the actor.
-      DisconnectRpcClient(queue->second);
-      inflight_task_callbacks = std::move(queue->second.inflight_task_callbacks);
-      queue->second.inflight_task_callbacks.clear();
-    }
-
-    queue->second.state = rpc::ActorTableData::ALIVE;
-    // Update the mapping so new RPCs go out with the right intended worker id.
-    queue->second.worker_id = address.worker_id();
-    // Create a new connection to the actor.
-    queue->second.rpc_client = core_worker_client_pool_.GetOrConnect(address);
-    // This assumes that all replies from the previous incarnation
-    // of the actor have been received. This assumption should be OK
-    // because we fail all inflight tasks in `DisconnectRpcClient`.
-    RAY_LOG(DEBUG) << "Resetting caller starts at for actor " << actor_id << " from "
-                   << queue->second.caller_starts_at << " to "
-                   << queue->second.next_task_reply_position;
-    queue->second.caller_starts_at = queue->second.next_task_reply_position;
-
-    RAY_LOG(INFO) << "Connecting to actor " << actor_id << " at worker "
-                  << WorkerID::FromBinary(address.worker_id());
-    ResendOutOfOrderTasks(actor_id);
-    SendPendingTasks(actor_id);
-  }
-
-  // NOTE(kfstorm): We need to make sure the lock is released before invoking callbacks.
-  FailInflightTasks(inflight_task_callbacks);
-}
-
-void CoreWorkerDirectActorTaskSubmitter::DisconnectActor(
-    const ActorID &actor_id, int64_t num_restarts, bool dead,
-    const std::shared_ptr<rpc::RayException> &creation_task_exception) {
-  RAY_LOG(DEBUG) << "Disconnecting from actor " << actor_id;
-
-  std::unordered_map<TaskID, rpc::ClientCallback<rpc::PushTaskReply>>
-      inflight_task_callbacks;
-
-  {
-    absl::MutexLock lock(&mu_);
-    auto queue = client_queues_.find(actor_id);
-    RAY_CHECK(queue != client_queues_.end());
-    if (!dead) {
-      RAY_CHECK(num_restarts > 0);
-    }
-    if (num_restarts <= queue->second.num_restarts && !dead) {
-      // This message is about an old version of the actor that has already been
-      // restarted successfully. Skip the message handling.
-      RAY_LOG(INFO)
-          << "Skip actor disconnection that has already been restarted, actor_id="
-          << actor_id;
-      return;
-    }
-
-    // The actor failed, so erase the client for now. Either the actor is
-    // permanently dead or the new client will be inserted once the actor is
-    // restarted.
-    DisconnectRpcClient(queue->second);
-    inflight_task_callbacks = std::move(queue->second.inflight_task_callbacks);
-    queue->second.inflight_task_callbacks.clear();
-
-    if (dead) {
-      queue->second.state = rpc::ActorTableData::DEAD;
-      queue->second.creation_task_exception = creation_task_exception;
-      // If there are pending requests, treat the pending tasks as failed.
-      RAY_LOG(INFO) << "Failing pending tasks for actor " << actor_id
-                    << " because the actor is already dead.";
-      auto &requests = queue->second.requests;
-      auto head = requests.begin();
-
-      auto status = Status::IOError("cancelling all pending tasks of dead actor");
-      while (head != requests.end()) {
-        const auto &task_spec = head->second.first;
-        task_finisher_.MarkTaskCanceled(task_spec.TaskId());
-        // No need to increment the number of completed tasks since the actor is
-        // dead.
-        RAY_UNUSED(!task_finisher_.PendingTaskFailed(task_spec.TaskId(),
-                                                     rpc::ErrorType::ACTOR_DIED, &status,
-                                                     creation_task_exception));
-        head = requests.erase(head);
-      }
-
-      auto &wait_for_death_info_tasks = queue->second.wait_for_death_info_tasks;
-
-      RAY_LOG(INFO) << "Failing tasks waiting for death info, size="
-                    << wait_for_death_info_tasks.size() << ", actor_id=" << actor_id;
-      for (auto &net_err_task : wait_for_death_info_tasks) {
-        RAY_UNUSED(task_finisher_.MarkPendingTaskFailed(
-            net_err_task.second, rpc::ErrorType::ACTOR_DIED, creation_task_exception));
-      }
-
-      // No need to clean up tasks that have been sent and are waiting for
-      // replies. They will be treated as failed once the connection dies.
-      // We retain the sequencing information so that we can properly fail
-      // any tasks submitted after the actor death.
-    } else if (queue->second.state != rpc::ActorTableData::DEAD) {
-      // Only update the actor's state if it is not permanently dead. The actor
-      // will eventually get restarted or marked as permanently dead.
-      queue->second.state = rpc::ActorTableData::RESTARTING;
-      queue->second.num_restarts = num_restarts;
-    }
-  }
-
-  // NOTE(kfstorm): We need to make sure the lock is released before invoking callbacks.
-  FailInflightTasks(inflight_task_callbacks);
-}
-
-void CoreWorkerDirectActorTaskSubmitter::CheckTimeoutTasks() {
-  absl::MutexLock lock(&mu_);
-  for (auto &queue_pair : client_queues_) {
-    auto &queue = queue_pair.second;
-    auto deque_itr = queue.wait_for_death_info_tasks.begin();
-    while (deque_itr != queue.wait_for_death_info_tasks.end() &&
-           /*timeout timestamp*/ deque_itr->first < current_time_ms()) {
-      auto task_spec = deque_itr->second;
-      task_finisher_.MarkPendingTaskFailed(task_spec, rpc::ErrorType::ACTOR_DIED);
-      deque_itr = queue.wait_for_death_info_tasks.erase(deque_itr);
-    }
-  }
-}
-
-void CoreWorkerDirectActorTaskSubmitter::SendPendingTasks(const ActorID &actor_id) {
-  auto it = client_queues_.find(actor_id);
-  RAY_CHECK(it != client_queues_.end());
-  if (!it->second.rpc_client) {
-    return;
-  }
-  auto &client_queue = it->second;
-
-  // Check if there is a pending force kill. If there is, send it and disconnect the
-  // client.
-  if (client_queue.pending_force_kill) {
-    RAY_LOG(INFO) << "Sending KillActor request to actor " << actor_id;
-    // It's okay if this fails because this means the worker is already dead.
-    client_queue.rpc_client->KillActor(*client_queue.pending_force_kill, nullptr);
-    client_queue.pending_force_kill.reset();
-  }
-
-  // Submit all pending requests.
-  auto &requests = client_queue.requests;
-  auto head = requests.begin();
-  while (head != requests.end() &&
-         (/*seqno*/ head->first <= client_queue.next_send_position) &&
-         (/*dependencies_resolved*/ head->second.second)) {
-    // If the task has been sent before, skip the other tasks in the send
-    // queue.
-    bool skip_queue = head->first < client_queue.next_send_position;
-    auto task_spec = std::move(head->second.first);
-    head = requests.erase(head);
-
-    RAY_CHECK(!client_queue.worker_id.empty());
-    PushActorTask(client_queue, task_spec, skip_queue);
-    client_queue.next_send_position++;
-  }
-}
-
-void CoreWorkerDirectActorTaskSubmitter::ResendOutOfOrderTasks(const ActorID &actor_id) {
-  auto it = client_queues_.find(actor_id);
-  RAY_CHECK(it != client_queues_.end());
-  if (!it->second.rpc_client) {
-    return;
-  }
-  auto &client_queue = it->second;
-  RAY_CHECK(!client_queue.worker_id.empty());
-
-  for (const auto &completed_task : client_queue.out_of_order_completed_tasks) {
-    // Making a copy here because we are flipping a flag and the original value is
-    // const.
-    auto task_spec = completed_task.second;
-    task_spec.GetMutableMessage().set_skip_execution(true);
-    PushActorTask(client_queue, task_spec, /*skip_queue=*/true);
-  }
-  client_queue.out_of_order_completed_tasks.clear();
-}
-
-void CoreWorkerDirectActorTaskSubmitter::PushActorTask(ClientQueue &queue,
-                                                       const TaskSpecification &task_spec,
-                                                       bool skip_queue) {
-  auto request = std::make_unique<rpc::PushTaskRequest>();
-  // NOTE(swang): CopyFrom is needed because if we use Swap here and the task
-  // fails, then the task data will be gone when the TaskManager attempts to
-  // access the task.
-  request->mutable_task_spec()->CopyFrom(task_spec.GetMessage());
-
-  request->set_intended_worker_id(queue.worker_id);
-  RAY_CHECK(task_spec.ActorCounter() >= queue.caller_starts_at)
-      << "actor counter " << task_spec.ActorCounter() << " " << queue.caller_starts_at;
-  request->set_sequence_number(task_spec.ActorCounter() - queue.caller_starts_at);
-
-  const auto task_id = task_spec.TaskId();
-  const auto actor_id = task_spec.ActorId();
-  const auto actor_counter = task_spec.ActorCounter();
-  const auto task_skipped = task_spec.GetMessage().skip_execution();
-  const auto num_queued =
-      request->sequence_number() - queue.rpc_client->ClientProcessedUpToSeqno();
-  RAY_LOG(DEBUG) << "Pushing task " << task_id << " to actor " << actor_id
-                 << " actor counter " << actor_counter << " seq no "
-                 << request->sequence_number() << " num queued " << num_queued;
-  if (num_queued >= next_queueing_warn_threshold_) {
-    // TODO(ekl) add more debug info about the actor name, etc.
-    warn_excess_queueing_(actor_id, num_queued);
-    next_queueing_warn_threshold_ *= 2;
-  }
-
-  rpc::Address addr(queue.rpc_client->Addr());
-  rpc::ClientCallback<rpc::PushTaskReply> reply_callback =
-      [this, addr, task_id, actor_id, actor_counter, task_spec, task_skipped](
-          const Status &status, const rpc::PushTaskReply &reply) {
-        bool increment_completed_tasks = true;
-
-        if (task_skipped) {
-          // NOTE(simon):Increment the task counter regardless of the status because the
-          // reply for a previously completed task. We are not calling CompletePendingTask
-          // because the tasks are pushed directly to the actor, not placed on any queues
-          // in task_finisher_.
-        } else if (status.ok()) {
-          task_finisher_.CompletePendingTask(task_id, reply, addr);
-        } else {
-          // push task failed due to network error. For example, actor is dead
-          // and no process response for the push task.
-          absl::MutexLock lock(&mu_);
-          auto queue_pair = client_queues_.find(actor_id);
-          RAY_CHECK(queue_pair != client_queues_.end());
-          auto &queue = queue_pair->second;
-
-          bool immediately_mark_object_fail = (queue.state == rpc::ActorTableData::DEAD);
-          bool will_retry = task_finisher_.PendingTaskFailed(
-              task_id, rpc::ErrorType::ACTOR_DIED, &status, queue.creation_task_exception,
-              immediately_mark_object_fail);
-          if (will_retry) {
-            increment_completed_tasks = false;
-          } else if (!immediately_mark_object_fail) {
-            // put it to wait_for_death_info_tasks and wait for Death info
-            int64_t death_info_timeout_ts =
-                current_time_ms() +
-                RayConfig::instance().timeout_ms_task_wait_for_death_info();
-            queue.wait_for_death_info_tasks.emplace_back(death_info_timeout_ts,
-                                                         task_spec);
-            RAY_LOG(INFO)
-                << "PushActorTask failed because of network error, this task "
-                   "will be stashed away and waiting for Death info from GCS, task_id="
-                << task_spec.TaskId()
-                << ", wait queue size=" << queue.wait_for_death_info_tasks.size();
-          }
-        }
-
-        if (increment_completed_tasks) {
-          absl::MutexLock lock(&mu_);
-          auto queue_pair = client_queues_.find(actor_id);
-          RAY_CHECK(queue_pair != client_queues_.end());
-          auto &queue = queue_pair->second;
-
-          // Try to increment queue.next_task_reply_position consecutively until we
-          // cannot. In the case of tasks not received in order, the following block
-          // ensure queue.next_task_reply_position are incremented to the max possible
-          // value.
-          queue.out_of_order_completed_tasks.insert({actor_counter, task_spec});
-          auto min_completed_task = queue.out_of_order_completed_tasks.begin();
-          while (min_completed_task != queue.out_of_order_completed_tasks.end()) {
-            if (min_completed_task->first == queue.next_task_reply_position) {
-              queue.next_task_reply_position++;
-              // increment the iterator and erase the old value
-              queue.out_of_order_completed_tasks.erase(min_completed_task++);
-            } else {
-              break;
-            }
-          }
-
-          RAY_LOG(DEBUG) << "Got PushTaskReply for actor " << actor_id
-                         << " with actor_counter " << actor_counter
-                         << " new queue.next_task_reply_position is "
-                         << queue.next_task_reply_position
-                         << " and size of out_of_order_tasks set is "
-                         << queue.out_of_order_completed_tasks.size();
-        }
-      };
-
-  queue.inflight_task_callbacks.emplace(task_id, std::move(reply_callback));
-  rpc::ClientCallback<rpc::PushTaskReply> wrapped_callback =
-      [this, task_id, actor_id](const Status &status, const rpc::PushTaskReply &reply) {
-        rpc::ClientCallback<rpc::PushTaskReply> reply_callback;
-        {
-          absl::MutexLock lock(&mu_);
-          auto it = client_queues_.find(actor_id);
-          RAY_CHECK(it != client_queues_.end());
-          auto &queue = it->second;
-          auto callback_it = queue.inflight_task_callbacks.find(task_id);
-          if (callback_it == queue.inflight_task_callbacks.end()) {
-            RAY_LOG(DEBUG) << "The task " << task_id
-                           << " has already been marked as failed. Ingore the reply.";
-            return;
-          }
-          reply_callback = std::move(callback_it->second);
-          queue.inflight_task_callbacks.erase(callback_it);
-        }
-        reply_callback(status, reply);
-      };
-
-  queue.rpc_client->PushActorTask(std::move(request), skip_queue, wrapped_callback);
-}
-
-bool CoreWorkerDirectActorTaskSubmitter::IsActorAlive(const ActorID &actor_id) const {
-  absl::MutexLock lock(&mu_);
-
-  auto iter = client_queues_.find(actor_id);
-  return (iter != client_queues_.end() && iter->second.rpc_client);
-}
-
 void CoreWorkerDirectTaskReceiver::Init(
-    std::shared_ptr<rpc::CoreWorkerClientPool> client_pool, rpc::Address rpc_address,
+    std::shared_ptr<rpc::CoreWorkerClientPool> client_pool,
+    rpc::Address rpc_address,
     std::shared_ptr<DependencyWaiter> dependency_waiter) {
   waiter_ = std::move(dependency_waiter);
   rpc_address_ = rpc_address;
@@ -501,7 +35,8 @@ void CoreWorkerDirectTaskReceiver::Init(
 }
 
 void CoreWorkerDirectTaskReceiver::HandleTask(
-    const rpc::PushTaskRequest &request, rpc::PushTaskReply *reply,
+    const rpc::PushTaskRequest &request,
+    rpc::PushTaskReply *reply,
     rpc::SendReplyCallback send_reply_callback) {
   RAY_CHECK(waiter_ != nullptr) << "Must call init() prior to use";
   // Use `mutable_task_spec()` here as `task_spec()` returns a const reference
@@ -523,7 +58,9 @@ void CoreWorkerDirectTaskReceiver::HandleTask(
 
   if (task_spec.IsActorCreationTask()) {
     worker_context_.SetCurrentActorId(task_spec.ActorCreationId());
-    SetMaxActorConcurrency(task_spec.IsAsyncioActor(), task_spec.MaxActorConcurrency());
+    SetupActor(task_spec.IsAsyncioActor(),
+               task_spec.MaxActorConcurrency(),
+               task_spec.ExecuteOutOfOrder());
   }
 
   // Only assign resources for non-actor tasks. Actor tasks inherit the resources
@@ -540,51 +77,95 @@ void CoreWorkerDirectTaskReceiver::HandleTask(
     }
   }
 
-  auto accept_callback = [this, reply, task_spec,
-                          resource_ids](rpc::SendReplyCallback send_reply_callback) {
+  auto accept_callback = [this, reply, task_spec, resource_ids](
+                             rpc::SendReplyCallback send_reply_callback) {
     if (task_spec.GetMessage().skip_execution()) {
       send_reply_callback(Status::OK(), nullptr, nullptr);
       return;
     }
 
     auto num_returns = task_spec.NumReturns();
-    if (task_spec.IsActorCreationTask() || task_spec.IsActorTask()) {
-      // Decrease to account for the dummy object id.
+    if (task_spec.IsActorCreationTask()) {
+      // Decrease to account for the dummy object id returned by the actor
+      // creation task.
       num_returns--;
     }
     RAY_CHECK(num_returns >= 0);
 
-    std::vector<std::shared_ptr<RayObject>> return_objects;
-    bool is_application_level_error = false;
-    auto status =
-        task_handler_(task_spec, resource_ids, &return_objects,
-                      reply->mutable_borrowed_refs(), &is_application_level_error);
-    reply->set_is_application_level_error(is_application_level_error);
+    std::vector<std::pair<ObjectID, std::shared_ptr<RayObject>>> return_objects;
+    std::vector<std::pair<ObjectID, std::shared_ptr<RayObject>>> dynamic_return_objects;
+    std::vector<std::pair<ObjectID, bool>> streaming_generator_returns;
+    bool is_retryable_error = false;
+    std::string application_error = "";
+    auto status = task_handler_(task_spec,
+                                resource_ids,
+                                &return_objects,
+                                &dynamic_return_objects,
+                                &streaming_generator_returns,
+                                reply->mutable_borrowed_refs(),
+                                &is_retryable_error,
+                                &application_error);
+    reply->set_is_retryable_error(is_retryable_error);
+    reply->set_is_application_error(!application_error.empty());
+    std::string task_execution_error;
+
+    if (!application_error.empty()) {
+      task_execution_error = "User exception:\n" + application_error;
+    }
+    // System errors occurred while executing the task.
+    if (!status.ok()) {
+      if (!task_execution_error.empty()) {
+        task_execution_error += "\n\n";
+      }
+      task_execution_error += "System error:\n" + status.ToString();
+    }
+
+    if (!task_execution_error.empty()) {
+      // Application errors occurred while executing the task.
+      // We could get the errors from return_objects, but it would require deserializing
+      // the serialized error message. So we just record the error message directly while
+      // executing the task.
+      reply->set_task_execution_error(task_execution_error);
+    }
+
+    for (const auto &it : streaming_generator_returns) {
+      const auto &object_id = it.first;
+      bool is_plasma_object = it.second;
+      auto return_id_proto = reply->add_streaming_generator_return_ids();
+      return_id_proto->set_object_id(object_id.Binary());
+      return_id_proto->set_is_plasma_object(is_plasma_object);
+    }
 
     bool objects_valid = return_objects.size() == num_returns;
-    if (objects_valid) {
-      for (size_t i = 0; i < return_objects.size(); i++) {
-        auto return_object = reply->add_return_objects();
-        ObjectID id = ObjectID::FromIndex(task_spec.TaskId(), /*index=*/i + 1);
-        return_object->set_object_id(id.Binary());
+    for (const auto &return_object : return_objects) {
+      if (return_object.second == NULL) {
+        objects_valid = false;
+      }
+    }
 
-        // The object is nullptr if it already existed in the object store.
-        const auto &result = return_objects[i];
-        return_object->set_size(result->GetSize());
-        if (result->GetData() != nullptr && result->GetData()->IsPlasmaBuffer()) {
-          return_object->set_in_plasma(true);
-        } else {
-          if (result->GetData() != nullptr) {
-            return_object->set_data(result->GetData()->Data(), result->GetData()->Size());
-          }
-          if (result->GetMetadata() != nullptr) {
-            return_object->set_metadata(result->GetMetadata()->Data(),
-                                        result->GetMetadata()->Size());
-          }
+    if (objects_valid) {
+      if (task_spec.ReturnsDynamic()) {
+        size_t num_dynamic_returns_expected = task_spec.DynamicReturnIds().size();
+        if (num_dynamic_returns_expected > 0) {
+          RAY_CHECK(dynamic_return_objects.size() == num_dynamic_returns_expected)
+              << "Expected " << num_dynamic_returns_expected
+              << " dynamic returns, but task generated " << dynamic_return_objects.size();
         }
-        for (const auto &nested_ref : result->GetNestedRefs()) {
-          return_object->add_nested_inlined_refs()->CopyFrom(nested_ref);
-        }
+      } else {
+        RAY_CHECK(dynamic_return_objects.size() == 0)
+            << "Task with static num_returns returned " << dynamic_return_objects.size()
+            << " objects dynamically";
+      }
+      for (const auto &dynamic_return : dynamic_return_objects) {
+        auto return_object_proto = reply->add_dynamic_return_objects();
+        SerializeReturnObject(
+            dynamic_return.first, dynamic_return.second, return_object_proto);
+      }
+      for (size_t i = 0; i < return_objects.size(); i++) {
+        const auto &return_object = return_objects[i];
+        auto return_object_proto = reply->add_return_objects();
+        SerializeReturnObject(
+            return_object.first, return_object.second, return_object_proto);
       }
 
       if (task_spec.IsActorCreationTask()) {
@@ -592,16 +173,32 @@ void CoreWorkerDirectTaskReceiver::HandleTask(
         /// be 0 if this is an asyncio actor.
         const int default_max_concurrency =
             task_spec.IsAsyncioActor() ? 0 : task_spec.MaxActorConcurrency();
-        pool_manager_ = std::make_shared<PoolManager>(task_spec.ConcurrencyGroups(),
-                                                      default_max_concurrency);
+        pool_manager_ = std::make_shared<ConcurrencyGroupManager<BoundedExecutor>>(
+            task_spec.ConcurrencyGroups(), default_max_concurrency);
+        if (task_spec.IsAsyncioActor()) {
+          fiber_state_manager_ = std::make_shared<ConcurrencyGroupManager<FiberState>>(
+              task_spec.ConcurrencyGroups(), fiber_max_concurrency_);
+        }
         concurrency_groups_cache_[task_spec.TaskId().ActorId()] =
             task_spec.ConcurrencyGroups();
-        RAY_LOG(INFO) << "Actor creation task finished, task_id: " << task_spec.TaskId()
-                      << ", actor_id: " << task_spec.ActorCreationId();
         // Tell raylet that an actor creation task has finished execution, so that
         // raylet can publish actor creation event to GCS, and mark this worker as
         // actor, thus if this worker dies later raylet will restart the actor.
-        RAY_CHECK_OK(task_done_());
+        RAY_CHECK_OK(actor_creation_task_done_());
+        if (status.IsCreationTaskError()) {
+          RAY_LOG(WARNING) << "Actor creation task finished with errors, task_id: "
+                           << task_spec.TaskId()
+                           << ", actor_id: " << task_spec.ActorCreationId()
+                           << ", status: " << status;
+        } else {
+          // Set the actor repr name if it's customized by the actor.
+          if (!actor_repr_name_.empty()) {
+            reply->set_actor_repr_name(actor_repr_name_);
+          }
+          RAY_LOG(INFO) << "Actor creation task finished, task_id: " << task_spec.TaskId()
+                        << ", actor_id: " << task_spec.ActorCreationId()
+                        << ", actor_repr_name: " << actor_repr_name_;
+        }
       }
     }
     if (status.ShouldExitWorker()) {
@@ -615,51 +212,80 @@ void CoreWorkerDirectTaskReceiver::HandleTask(
         send_reply_callback(status, nullptr, nullptr);
       }
     } else {
-      RAY_CHECK(objects_valid) << return_objects.size() << "  " << num_returns;
+      RAY_CHECK(objects_valid);
       send_reply_callback(status, nullptr, nullptr);
     }
   };
 
-  auto reject_callback = [](rpc::SendReplyCallback send_reply_callback) {
-    send_reply_callback(Status::Invalid("client cancelled stale rpc"), nullptr, nullptr);
+  auto cancel_callback = [reply, task_spec](const Status &status,
+                                            rpc::SendReplyCallback send_reply_callback) {
+    if (task_spec.IsActorTask()) {
+      // We consider cancellation of actor tasks to be a push task RPC failure.
+      send_reply_callback(status, nullptr, nullptr);
+    } else {
+      // We consider cancellation of normal tasks to be an in-band cancellation of a
+      // successful RPC.
+      reply->set_was_cancelled_before_running(true);
+      send_reply_callback(status, nullptr, nullptr);
+    }
   };
 
-  auto steal_callback = [this, task_spec,
-                         reply](rpc::SendReplyCallback send_reply_callback) {
-    RAY_LOG(DEBUG) << "Task " << task_spec.TaskId() << " was stolen from "
-                   << worker_context_.GetWorkerID()
-                   << "'s non_actor_task_queue_! Setting reply->set_task_stolen(true)!";
-    reply->set_task_stolen(true);
-    send_reply_callback(Status::OK(), nullptr, nullptr);
-  };
-
-  auto dependencies = task_spec.GetDependencies(false);
+  auto dependencies = task_spec.GetDependencies();
 
   if (task_spec.IsActorTask()) {
     auto it = actor_scheduling_queues_.find(task_spec.CallerWorkerId());
     if (it == actor_scheduling_queues_.end()) {
       auto cg_it = concurrency_groups_cache_.find(task_spec.ActorId());
       RAY_CHECK(cg_it != concurrency_groups_cache_.end());
-      auto result = actor_scheduling_queues_.emplace(
-          task_spec.CallerWorkerId(),
-          std::unique_ptr<SchedulingQueue>(new ActorSchedulingQueue(
-              task_main_io_service_, *waiter_, pool_manager_, is_asyncio_,
-              fiber_max_concurrency_, cg_it->second)));
-      it = result.first;
+      if (execute_out_of_order_) {
+        it = actor_scheduling_queues_
+                 .emplace(task_spec.CallerWorkerId(),
+                          std::unique_ptr<SchedulingQueue>(
+                              new OutOfOrderActorSchedulingQueue(task_main_io_service_,
+                                                                 *waiter_,
+                                                                 pool_manager_,
+                                                                 fiber_state_manager_,
+                                                                 is_asyncio_,
+                                                                 fiber_max_concurrency_,
+                                                                 cg_it->second)))
+                 .first;
+      } else {
+        it = actor_scheduling_queues_
+                 .emplace(task_spec.CallerWorkerId(),
+                          std::unique_ptr<SchedulingQueue>(
+                              new ActorSchedulingQueue(task_main_io_service_,
+                                                       *waiter_,
+                                                       pool_manager_,
+                                                       fiber_state_manager_,
+                                                       is_asyncio_,
+                                                       fiber_max_concurrency_,
+                                                       cg_it->second)))
+                 .first;
+      }
     }
 
-    it->second->Add(request.sequence_number(), request.client_processed_up_to(),
-                    std::move(accept_callback), std::move(reject_callback),
-                    std::move(send_reply_callback), task_spec.ConcurrencyGroupName(),
-                    task_spec.FunctionDescriptor(), nullptr, task_spec.TaskId(),
+    it->second->Add(request.sequence_number(),
+                    request.client_processed_up_to(),
+                    std::move(accept_callback),
+                    std::move(cancel_callback),
+                    std::move(send_reply_callback),
+                    task_spec.ConcurrencyGroupName(),
+                    task_spec.FunctionDescriptor(),
+                    task_spec.TaskId(),
                     dependencies);
   } else {
     // Add the normal task's callbacks to the non-actor scheduling queue.
-    normal_scheduling_queue_->Add(
-        request.sequence_number(), request.client_processed_up_to(),
-        std::move(accept_callback), std::move(reject_callback),
-        std::move(send_reply_callback), "", task_spec.FunctionDescriptor(),
-        std::move(steal_callback), task_spec.TaskId(), dependencies);
+    RAY_LOG(DEBUG) << "Adding task " << task_spec.TaskId()
+                   << " to normal scheduling task queue.";
+    normal_scheduling_queue_->Add(request.sequence_number(),
+                                  request.client_processed_up_to(),
+                                  std::move(accept_callback),
+                                  std::move(cancel_callback),
+                                  std::move(send_reply_callback),
+                                  "",
+                                  task_spec.FunctionDescriptor(),
+                                  task_spec.TaskId(),
+                                  dependencies);
   }
 }
 
@@ -673,14 +299,15 @@ void CoreWorkerDirectTaskReceiver::RunNormalTasksFromQueue() {
   normal_scheduling_queue_->ScheduleRequests();
 }
 
-void CoreWorkerDirectTaskReceiver::HandleStealTasks(
-    const rpc::StealTasksRequest &request, rpc::StealTasksReply *reply,
-    rpc::SendReplyCallback send_reply_callback) {
-  size_t n_tasks_stolen = normal_scheduling_queue_->Steal(reply);
-  RAY_LOG(DEBUG) << "Number of tasks stolen is " << n_tasks_stolen;
-
-  // send reply back
-  send_reply_callback(Status::OK(), nullptr, nullptr);
+bool CoreWorkerDirectTaskReceiver::CancelQueuedActorTask(const WorkerID &caller_worker_id,
+                                                         const TaskID &task_id) {
+  auto it = actor_scheduling_queues_.find(caller_worker_id);
+  if (it != actor_scheduling_queues_.end()) {
+    return it->second->CancelTaskIfFound(task_id);
+  } else {
+    // Queue doesn't exist. It can happen if a task hasn't been received yet.
+    return false;
+  }
 }
 
 bool CoreWorkerDirectTaskReceiver::CancelQueuedNormalTask(TaskID task_id) {
@@ -690,18 +317,24 @@ bool CoreWorkerDirectTaskReceiver::CancelQueuedNormalTask(TaskID task_id) {
 }
 
 /// Note that this method is only used for asyncio actor.
-void CoreWorkerDirectTaskReceiver::SetMaxActorConcurrency(bool is_asyncio,
-                                                          int fiber_max_concurrency) {
+void CoreWorkerDirectTaskReceiver::SetupActor(bool is_asyncio,
+                                              int fiber_max_concurrency,
+                                              bool execute_out_of_order) {
   RAY_CHECK(fiber_max_concurrency_ == 0)
-      << "SetMaxActorConcurrency should only be called at most once.";
+      << "SetupActor should only be called at most once.";
   is_asyncio_ = is_asyncio;
   fiber_max_concurrency_ = fiber_max_concurrency;
+  execute_out_of_order_ = execute_out_of_order;
 }
 
 void CoreWorkerDirectTaskReceiver::Stop() {
-  for (const auto &it : actor_scheduling_queues_) {
-    it.second->Stop();
+  for (const auto &[_, scheduling_queue] : actor_scheduling_queues_) {
+    scheduling_queue->Stop();
   }
+}
+
+void CoreWorkerDirectTaskReceiver::SetActorReprName(const std::string &repr_name) {
+  actor_repr_name_ = repr_name;
 }
 
 }  // namespace core

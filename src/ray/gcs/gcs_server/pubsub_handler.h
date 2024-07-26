@@ -14,8 +14,11 @@
 
 #pragma once
 
+#include "absl/container/flat_hash_map.h"
+#include "absl/container/flat_hash_set.h"
 #include "ray/gcs/pubsub/gcs_pub_sub.h"
 #include "ray/rpc/gcs_server/gcs_rpc_server.h"
+#include "src/ray/protobuf/gcs_service.grpc.pb.h"
 
 namespace ray {
 namespace gcs {
@@ -25,22 +28,38 @@ namespace gcs {
 /// de-registering subscribers.
 class InternalPubSubHandler : public rpc::InternalPubSubHandler {
  public:
-  explicit InternalPubSubHandler(const std::shared_ptr<gcs::GcsPublisher> &gcs_publisher)
-      : gcs_publisher_(gcs_publisher) {}
+  InternalPubSubHandler(instrumented_io_context &io_service,
+                        const std::shared_ptr<gcs::GcsPublisher> &gcs_publisher);
 
-  void HandleGcsSubscriberPoll(const rpc::GcsSubscriberPollRequest &request,
+  void HandleGcsPublish(rpc::GcsPublishRequest request,
+                        rpc::GcsPublishReply *reply,
+                        rpc::SendReplyCallback send_reply_callback) final;
+
+  void HandleGcsSubscriberPoll(rpc::GcsSubscriberPollRequest request,
                                rpc::GcsSubscriberPollReply *reply,
                                rpc::SendReplyCallback send_reply_callback) final;
 
-  void HandleGcsSubscriberCommandBatch(
-      const rpc::GcsSubscriberCommandBatchRequest &request,
-      rpc::GcsSubscriberCommandBatchReply *reply,
-      rpc::SendReplyCallback send_reply_callback) final;
+  void HandleGcsSubscriberCommandBatch(rpc::GcsSubscriberCommandBatchRequest request,
+                                       rpc::GcsSubscriberCommandBatchReply *reply,
+                                       rpc::SendReplyCallback send_reply_callback) final;
+
+  void HandleGcsUnregisterSubscriber(rpc::GcsUnregisterSubscriberRequest request,
+                                     rpc::GcsUnregisterSubscriberReply *reply,
+                                     rpc::SendReplyCallback send_reply_callback) final;
+
+  // Stops the event loop and the thread of the pubsub handler.
+  void Stop();
 
   std::string DebugString() const;
 
+  void RemoveSubscriberFrom(const std::string &sender_id);
+
  private:
+  /// Not owning the io service, to allow sharing it with pubsub::Publisher.
+  instrumented_io_context &io_service_;
+  std::unique_ptr<std::thread> io_service_thread_;
   std::shared_ptr<gcs::GcsPublisher> gcs_publisher_;
+  absl::flat_hash_map<std::string, absl::flat_hash_set<UniqueID>> sender_to_subscribers_;
 };
 
 }  // namespace gcs

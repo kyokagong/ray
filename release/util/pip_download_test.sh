@@ -31,10 +31,12 @@ pip install --upgrade pip
 # This is required to use conda activate
 source "$(conda info --base)/etc/profile.d/conda.sh"
 
-for PYTHON_VERSION in "3.6" "3.7" "3.8" "3.9"
+PYTHON_VERSIONS=( "3.8" "3.9" "3.10" "3.11" )
+
+for PYTHON_VERSION in "${PYTHON_VERSIONS[@]}"
 do
     env_name="${RAY_VERSION}-${PYTHON_VERSION}-env"
-    conda create -y -n "${env_name}" python=${PYTHON_VERSION}
+    conda create -y -n "${env_name}" python="${PYTHON_VERSION}"
     conda activate "${env_name}"
     printf "\n\n\n"
     echo "========================================================="
@@ -51,7 +53,7 @@ do
     cpp_failed=false
     printf "\n\n\n"
     echo "========================================================="
-    if python sanity_check.py; then
+    if python sanity_check.py --ray_version="$RAY_VERSION" --ray_commit="$RAY_HASH"; then
         echo "PYTHON ${PYTHON_VERSION} succeed sanity check."
     else
         failed=true

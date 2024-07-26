@@ -14,6 +14,25 @@
 
 #pragma once
 
+#ifdef __APPLE__
+#include <pthread.h>
+#endif
+
+#ifdef __linux__
+#include <sys/syscall.h>
+#endif
+
+#ifdef _WIN32
+#ifndef _WINDOWS_
+#ifndef WIN32_LEAN_AND_MEAN  // Sorry for the inconvenience. Please include any related
+                             // headers you need manually.
+                             // (https://stackoverflow.com/a/8294669)
+#define WIN32_LEAN_AND_MEAN  // Prevent inclusion of WinSock2.h
+#endif
+#include <Windows.h>  // Force inclusion of WinGDI here to resolve name conflict
+#endif
+#endif
+
 #include <chrono>
 #include <iterator>
 #include <memory>
@@ -24,6 +43,8 @@
 #include <thread>
 #include <unordered_map>
 
+#include "absl/container/flat_hash_map.h"
+#include "absl/random/random.h"
 #include "ray/util/logging.h"
 #include "ray/util/macros.h"
 #include "ray/util/process.h"
@@ -85,6 +106,25 @@ inline std::string AppendToEachLine(const std::string &str,
   return ss.str();
 }
 
+// Returns the TID of the calling thread.
+#ifdef __APPLE__
+inline uint64_t GetTid() {
+  uint64_t tid;
+  RAY_CHECK_EQ(pthread_threadid_np(NULL, &tid), 0);
+  return tid;
+}
+#elif defined(_WIN32)
+inline DWORD GetTid() { return GetCurrentThreadId(); }
+#else
+inline pid_t GetTid() { return syscall(__NR_gettid); }
+#endif
+
+inline int64_t current_sys_time_s() {
+  std::chrono::seconds s_since_epoch = std::chrono::duration_cast<std::chrono::seconds>(
+      std::chrono::system_clock::now().time_since_epoch());
+  return s_since_epoch.count();
+}
+
 /// Return the number of milliseconds since the steady clock epoch. NOTE: The
 /// returned timestamp may be used for accurately measuring intervals but has
 /// no relation to wall clock time. It must not be used for synchronization
@@ -113,6 +153,38 @@ inline int64_t current_sys_time_us() {
       std::chrono::duration_cast<std::chrono::microseconds>(
           std::chrono::system_clock::now().time_since_epoch());
   return mu_since_epoch.count();
+}
+
+inline std::string GenerateUUIDV4() {
+  static std::random_device rd;
+  static std::mt19937 gen(rd());
+  static std::uniform_int_distribution<> dis(0, 15);
+  static std::uniform_int_distribution<> dis2(8, 11);
+
+  std::stringstream ss;
+  int i;
+  ss << std::hex;
+  for (i = 0; i < 8; i++) {
+    ss << dis(gen);
+  }
+  ss << "-";
+  for (i = 0; i < 4; i++) {
+    ss << dis(gen);
+  }
+  ss << "-4";
+  for (i = 0; i < 3; i++) {
+    ss << dis(gen);
+  }
+  ss << "-";
+  ss << dis2(gen);
+  for (i = 0; i < 3; i++) {
+    ss << dis(gen);
+  }
+  ss << "-";
+  for (i = 0; i < 12; i++) {
+    ss << dis(gen);
+  };
+  return ss.str();
 }
 
 /// A helper function to parse command-line arguments in a platform-compatible manner.
@@ -154,7 +226,7 @@ ParseUrlEndpoint(const std::string &endpoint, int default_port = 0);
 ///   num_objects: 9,
 ///   offset: 8388878
 /// }
-std::shared_ptr<std::unordered_map<std::string, std::string>> ParseURL(std::string url);
+std::shared_ptr<absl::flat_hash_map<std::string, std::string>> ParseURL(std::string url);
 
 class InitShutdownRAII {
  public:
@@ -193,44 +265,40 @@ struct EnumClassHash {
 
 /// unordered_map for enum class type.
 template <typename Key, typename T>
-using EnumUnorderedMap = std::unordered_map<Key, T, EnumClassHash>;
-
-namespace ray {
-namespace internal {
-inline __suppress_ubsan__("signed-integer-overflow") int64_t GenerateSeed() {
-  int64_t seed = std::chrono::high_resolution_clock::now().time_since_epoch().count();
-  // To increase the entropy, mix in a number of time samples instead of a single one.
-  // This avoids the possibility of duplicate seeds for many workers that start in
-  // close succession.
-  for (int i = 0; i < 128; i++) {
-    std::this_thread::sleep_for(std::chrono::microseconds(10));
-    seed += std::chrono::high_resolution_clock::now().time_since_epoch().count();
-  }
-  return seed;
-}
-}  // namespace internal
-}  // namespace ray
+using EnumUnorderedMap = absl::flat_hash_map<Key, T, EnumClassHash>;
 
 /// A helper function to fill random bytes into the `data`.
 /// Warning: this is not fork-safe, we need to re-seed after that.
 template <typename T>
 void FillRandom(T *data) {
   RAY_CHECK(data != nullptr);
-  auto randomly_seeded_mersenne_twister = []() {
-    std::mt19937 seeded_engine(ray::internal::GenerateSeed());
-    return seeded_engine;
-  };
 
-  // NOTE(pcm): The right way to do this is to have one std::mt19937 per
-  // thread (using the thread_local keyword), but that's not supported on
-  // older versions of macOS (see https://stackoverflow.com/a/29929949)
-  static std::mutex random_engine_mutex;
-  std::lock_guard<std::mutex> lock(random_engine_mutex);
-  static std::mt19937 generator = randomly_seeded_mersenne_twister();
-  std::uniform_int_distribution<uint32_t> dist(0, std::numeric_limits<uint8_t>::max());
+  thread_local absl::BitGen generator;
   for (size_t i = 0; i < data->size(); i++) {
-    (*data)[i] = static_cast<uint8_t>(dist(generator));
+    (*data)[i] = static_cast<uint8_t>(
+        absl::Uniform(generator, 0, std::numeric_limits<uint8_t>::max()));
   }
+}
+
+inline void setEnv(const std::string &name, const std::string &value) {
+#ifdef _WIN32
+  std::string env = name + "=" + value;
+  int ret = _putenv(env.c_str());
+#else
+  int ret = setenv(name.c_str(), value.c_str(), 1);
+#endif
+  RAY_CHECK_EQ(ret, 0) << "Failed to set env var " << name << " " << value;
+}
+
+inline void unsetEnv(const std::string &name) {
+#ifdef _WIN32
+  // Use _putenv on Windows with an empty value to unset
+  std::string env = name + "=";
+  int ret = _putenv(env.c_str());
+#else
+  int ret = unsetenv(name.c_str());
+#endif
+  RAY_CHECK_EQ(ret, 0) << "Failed to unset env var " << name;
 }
 
 inline void SetThreadName(const std::string &thread_name) {
@@ -327,7 +395,8 @@ class ExponentialBackOff {
   /// \param[in] multiplier The multiplier for this counter.
   /// \param[in] max_value The maximum value for this counter. By default it's
   ///    infinite double.
-  ExponentialBackOff(uint64_t initial_value, double multiplier,
+  ExponentialBackOff(uint64_t initial_value,
+                     double multiplier,
                      uint64_t max_value = std::numeric_limits<uint64_t>::max())
       : curr_value_(initial_value),
         initial_value_(initial_value),
@@ -360,5 +429,10 @@ bool IsRayletFailed(const std::string &raylet_pid);
 
 /// Teriminate the process without cleaning up the resources.
 void QuickExit();
+
+/// \param value the value to be formatted to string
+/// \param precision the precision to format the value to
+/// \return the foramtted value
+std::string FormatFloat(float value, int32_t precision);
 
 }  // namespace ray
