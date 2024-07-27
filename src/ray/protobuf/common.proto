@@ -20,7 +20,7 @@ package ray.rpc;
 import "src/ray/protobuf/runtime_env_common.proto";
 
 option java_package = "io.ray.runtime.generated";
-option go_package = "generated";
+option go_package = "github.com/ray-project/ray/go/internal/runtime/generated";
 
 // Language of a task or worker.
 enum Language {

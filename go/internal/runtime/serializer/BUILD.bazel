@@ -5,7 +5,7 @@ go_library(
     srcs = [
         "serializer.go",
     ],
-    importpath = "ray/internal/runtime/serializer",
+    importpath = "github.com/ray-project/ray/go/internal/runtime/serializer",
     visibility = ["//visibility:public"],
     deps = [
         "@com_github_vmihailenco_msgpack_v5//:go_default_library",

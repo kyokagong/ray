@@ -1,35 +1,49 @@
 package runtime
 
 import (
-	"ray/internal/runtime/object"
-	"ray/internal/runtime/task"
+	"time"
+
+	"github.com/ray-project/ray/go/internal/runtime/object"
+	"github.com/ray-project/ray/go/internal/runtime/task"
 )
 
 // Local GO Ray Runtime, contains LocalObjectStore
 type LocalRayRuntime struct {
-	ObjectStore   object.LocalObjectStore
-	TaskSubmitter task.TaskSubmitter
+	ObjectStore   *object.LocalObjectStore
+	TaskSubmitter *task.LocalTaskSubmitter
 }
 
 // Submit Task to Task Executor
-func (localRayRuntime LocalRayRuntime) Call(remoteFunctionHolder task.RemoteFunctionHolder, args interface{}) object.ObjectRef {
-	return object.ObjectRef{"test"}
+func (runtime *LocalRayRuntime) Call(remoteFunctionHolder *task.RemoteFunctionHolder, args []interface{}) (object.ObjectRef, error) {
+	objRef, err := runtime.TaskSubmitter.SubmitTask(remoteFunctionHolder, args)
+	if err != nil {
+		return object.ObjectRef{}, err
+	}
+	return objRef, nil
 }
 
-func (localRayRuntime LocalRayRuntime) Put(obj interface{}) object.ObjectRef {
-	return localRayRuntime.ObjectStore.Put(obj)
+func (runtime *LocalRayRuntime) Put(obj interface{}) (object.ObjectRef, error) {
+	return runtime.ObjectStore.Put(obj)
 }
 
-func (localRayRuntime LocalRayRuntime) Get(objRef object.ObjectRef) interface{} {
-	return localRayRuntime.ObjectStore.Get(objRef)
+func (runtime *LocalRayRuntime) Get(objRef object.ObjectRef) (interface{}, error) {
+	for {
+		if value, err := runtime.ObjectStore.Get(objRef); err == nil {
+			return value, nil
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 }
 
-func (localRayRuntime LocalRayRuntime) Wait() {
-
+func (runtime *LocalRayRuntime) Wait() error {
+	return nil
 }
 
-func InitLocalRuntime() LocalRayRuntime {
+func NewLocalRuntime() LocalRayRuntime {
+	localObjectStore := object.NewLocalObjectStore()
+	localTaskSubmitter := task.NewLocalTaskSubmitter(&localObjectStore)
 	return LocalRayRuntime{
-		object.InitLocalObjectStore(),
-		task.NewLocalTaskSubmitter()}
+		ObjectStore:   &localObjectStore,
+		TaskSubmitter: &localTaskSubmitter,
+	}
 }

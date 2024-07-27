@@ -1,8 +1,9 @@
 package cmd_test
 
 import (
-	w "ray/internal/runtime/worker"
 	"testing"
+
+	w "github.com/ray-project/ray/go/internal/runtime/worker"
 )
 
 func TestStartDefaultWorker(t *testing.T) {

@@ -18,6 +18,7 @@ option cc_enable_arenas = true;
 package ray.rpc;
 
 option java_package = "io.ray.runtime.generated";
+option go_package = "github.com/ray-project/ray/go/internal/runtime/generated";
 
 message RuntimeEnvUris {
   /// working dir uri

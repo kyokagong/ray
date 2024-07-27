@@ -8,7 +8,7 @@ go_library(
         # "cgo_core_worker.h",
     ],
     cgo = True,
-    importpath = "ray/internal/runtime/worker",
+    importpath = "github.com/ray-project/ray/go/internal/runtime/worker",
     visibility = ["//visibility:public"],
     deps = [
         "//go/internal/runtime/config:config_lib",

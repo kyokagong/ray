@@ -8,7 +8,7 @@ go_library(
         "object_ref.go",
         "object_store.go",
     ],
-    importpath = "ray/internal/runtime/object",
+    importpath = "github.com/ray-project/ray/go/internal/runtime/object",
     visibility = ["//visibility:public"],
     deps = [
         "//go/internal/runtime/serializer:serializer_lib",

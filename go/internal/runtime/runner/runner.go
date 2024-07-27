@@ -5,7 +5,8 @@ import (
 	"fmt"
 	"log"
 	"os/exec"
-	c "ray/internal/runtime/config"
+
+	c "github.com/ray-project/ray/go/internal/runtime/config"
 )
 
 func StartRayHead(rayConfig c.RayConfig) {

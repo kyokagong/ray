@@ -1,0 +1,13 @@
+load("@io_bazel_rules_go//go:def.bzl", "go_library")
+
+go_library(
+    name = "logger_lib",
+    srcs = [
+        "logger.go",
+    ],
+    importpath = "github.com/ray-project/ray/go/internal/logger",
+    visibility = ["//go:__subpackages__"],
+    deps = [
+    ],
+    gc_goopts = ["-G=3"]
+)

@@ -1,9 +1,11 @@
 package runtime_test
 
 import (
-	"ray/internal/runtime"
-	c "ray/internal/runtine/config"
 	"testing"
+
+	c "github.com/ray-project/ray/go/internal/runtine/config"
+
+	"github.com/ray-project/ray/go/internal/runtime"
 )
 
 func TestInitRuntime(t *testing.T) {

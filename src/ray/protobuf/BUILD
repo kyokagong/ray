@@ -7,7 +7,13 @@ load("@rules_proto_grpc//python:defs.bzl", "python_grpc_compile")
 proto_library(
     name = "common_proto",
     srcs = ["common.proto"],
-    visibility = ["//java:__subpackages__"],
+    visibility = [
+        "//java:__subpackages__",
+        "//go:__subpackages__",
+    ],
+    deps = [
+        ":runtime_env_common_proto",
+    ],
 )
 
 cc_proto_library(
@@ -23,8 +29,55 @@ python_grpc_compile(
 proto_library(
     name = "gcs_proto",
     srcs = ["gcs.proto"],
+    visibility = [
+        "//java:__subpackages__",
+        "//go:__subpackages__",
+    ],
+    deps = [
+        ":common_proto",
+        ":runtime_env_common_proto",
+    ],
+)
+
+proto_library(
+    name = "instance_manager_proto",
+    srcs = ["experimental/instance_manager.proto"],
+)
+
+python_grpc_compile(
+    name = "instance_manager_py_proto",
+    deps = [":instance_manager_proto"],
+)
+
+cc_proto_library(
+    name = "instance_manager_cc_proto",
+    deps = [":instance_manager_proto"],
+)
+
+proto_library(
+    name = "runtime_env_common_proto",
+    srcs = ["runtime_env_common.proto"],
     visibility = ["//java:__subpackages__"],
-    deps = [":common_proto"],
+)
+
+proto_library(
+    name = "ray_syncer_proto",
+    srcs = ["ray_syncer.proto"],
+)
+
+cc_proto_library(
+    name = "ray_syncer_cc_proto",
+    deps = [":ray_syncer_proto"],
+)
+
+cc_proto_library(
+    name = "runtime_env_common_cc_proto",
+    deps = [":runtime_env_common_proto"],
+)
+
+python_grpc_compile(
+    name = "runtime_env_common_py_proto",
+    deps = [":runtime_env_common_proto"],
 )
 
 cc_proto_library(
@@ -283,7 +336,7 @@ proto_library(
     srcs = ["serve.proto"],
     visibility = [
         "//java:__subpackages__",
-        "//go:__subpackages__",    
+        "//go:__subpackages__",
     ],
 )
 

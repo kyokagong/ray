@@ -4,7 +4,7 @@
 // 	protoc        v3.16.0
 // source: src/ray/protobuf/common.proto
 
-package _go
+package generated
 
 import (
 	proto "github.com/golang/protobuf/proto"

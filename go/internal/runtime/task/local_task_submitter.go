@@ -1,65 +1,154 @@
 package task
 
 import (
-	"ray/internal/runtime/common"
-	"ray/internal/runtime/generated"
+	"bytes"
+	"sync"
+
+	"github.com/ray-project/ray/go/internal/logger"
+	"github.com/ray-project/ray/go/internal/runtime/generated"
+	"github.com/ray-project/ray/go/internal/runtime/object"
+	"github.com/ray-project/ray/go/internal/runtime/serializer"
 )
 
 type LocalTaskSubmitter struct {
-	rayFunc RayFunction
-	args    []interface{}
-	// waitingTasks Map[api.ObjectRef]TaskSpec
+	TaskExecutor   *LocalTaskExecutor
+	TaskObjRefMap  map[string]object.ObjectRef
+	ExecuteService *GoroutinePool
+	ObjectStore    *object.LocalObjectStore
+}
+
+type RunnableTask func()
+
+// GoroutinePool 是一个goroutine池
+type GoroutinePool struct {
+	taskChan chan RunnableTask
+	wg       sync.WaitGroup
+}
+
+// NewGoroutinePool 创建一个新的goroutine池
+func NewGoroutinePool(maxGoroutines int) *GoroutinePool {
+	pool := &GoroutinePool{
+		taskChan: make(chan RunnableTask),
+	}
+	pool.wg.Add(maxGoroutines)
+	for i := 0; i < maxGoroutines; i++ {
+		go func() {
+			defer pool.wg.Done()
+			for task := range pool.taskChan {
+				task()
+			}
+		}()
+	}
+	return pool
+}
+
+// Run 提交一个任务到goroutine池
+func (p *GoroutinePool) Run(task RunnableTask) {
+	p.taskChan <- task
+}
+
+// Shutdown 等待所有goroutine停止
+func (p *GoroutinePool) Shutdown() {
+	close(p.taskChan)
+	p.wg.Wait()
 }
 
 // Create task spec and submit
-func (localTaskSubmitter LocalTaskSubmitter) SubmitTask() string {
-	taskSpec := buildTaskSpec(common.TaskType_NORMAL_TASK, localTaskSubmitter.rayFunc, localTaskSubmitter.args)
-	localTaskSubmitter.submitTaskSpec(taskSpec)
-	return localTaskSubmitter.GetReturnIds(taskSpec)
+func (submitter *LocalTaskSubmitter) SubmitTask(remoteFunctionHolder *RemoteFunctionHolder, args []interface{}) (object.ObjectRef, error) {
+	rayFunction, err := GetFunctionManager().GetRayFunction(remoteFunctionHolder.FuncWrapper.FuncName)
+	if err != nil {
+		return object.ObjectRef{}, err
+	}
+	taskSpec, err := buildTaskSpec(generated.TaskType_NORMAL_TASK, rayFunction, args)
+	if err != nil {
+		return object.ObjectRef{}, err
+	}
+	submitter.submitTaskSpec(taskSpec)
+	return submitter.GetReturnObjefRef(taskSpec), nil
 }
 
-func (localTaskSubmitter LocalTaskSubmitter) submitTaskSpec(taskSpec generated.TaskSpec) {
+func (submitter *LocalTaskSubmitter) submitTaskSpec(taskSpec *generated.TaskSpec) {
+	runnableTask := func() {
+		funcName := taskSpec.GetFunctionDescriptor().GetGoFunctionDescriptor().FunctionName
 
+		var args []interface{}
+		for _, tArg := range taskSpec.Args {
+			arg, err := serializer.Deserialize(tArg.GetData())
+			if err != nil {
+				logger.Errorf("runnableTask Deserialize error: %v", err)
+				// put error in object store
+			}
+			args = append(args, arg)
+		}
+		result := submitter.TaskExecutor.ExecuteTask(funcName, args)
+		objRef := submitter.GetReturnObjefRef(taskSpec)
+		submitter.ObjectStore.PutRaw(objRef, result.Value)
+	}
+	submitter.ExecuteService.Run(runnableTask)
 }
 
-func (localTaskSubmitter LocalTaskSubmitter) GetReturnIds(taskSpec generated.TaskSpec) string {
-	return "test"
+func (submitter *LocalTaskSubmitter) GetReturnObjefRef(taskSpec *generated.TaskSpec) object.ObjectRef {
+	strTaskId := string(taskSpec.GetTaskId())
+	objRef, found := submitter.TaskObjRefMap[strTaskId]
+	if !found {
+		objRef = object.NewObjectRef()
+		submitter.TaskObjRefMap[strTaskId] = objRef
+	}
+	return objRef
 }
 
-func CreateLocalTaskSubmitter(rayFunc RayFunction, args []interface{}) LocalTaskSubmitter {
-	return LocalTaskSubmitter{rayFunc, args}
+func NewLocalTaskSubmitter(objectStore *object.LocalObjectStore) LocalTaskSubmitter {
+	executeService := NewGoroutinePool(10)
+	return LocalTaskSubmitter{
+		NewLocaLocalTaskExecutor(objectStore),
+		make(map[string]object.ObjectRef),
+		executeService,
+		objectStore,
+	}
 }
 
 // Build task spec
-func buildTaskSpec(taskType common.TaskType, rayFunc RayFunction, args []interface{}) generated.TaskSpec {
+func buildTaskSpec(taskType generated.TaskType, rayFunc RayFunction, args []interface{}) (*generated.TaskSpec, error) {
 
 	jobId := []byte("testJobId")
 	taskId := []byte("testTaskId")
-	skipException := false
-	return generated.TaskSpec{
-		generated.TaskType_NORMAL_TASK,
-		rayFunc.functionDescriptor.functionName,
-		generated.Language_GO,
-		generated.GoFunctionDescriptor{rayFunc.functionDescriptor.functionName},
-		jobId,
-		taskId,
-	ParentTaskId                    []byte                 `protobuf:"bytes,7,opt,name=parent_task_id,json=parentTaskId,proto3" json:"parent_task_id,omitempty"`
-	ParentCounter                   uint64                 `protobuf:"varint,8,opt,name=parent_counter,json=parentCounter,proto3" json:"parent_counter,omitempty"`
-	CallerId                        []byte                 `protobuf:"bytes,9,opt,name=caller_id,json=callerId,proto3" json:"caller_id,omitempty"`
-	CallerAddress                   *Address               `protobuf:"bytes,10,opt,name=caller_address,json=callerAddress,proto3" json:"caller_address,omitempty"`
-		generated.TaskArg{},
-		1,
-	RequiredResources               map[string]float64     `protobuf:"bytes,13,rep,name=required_resources,json=requiredResources,proto3" json:"required_resources,omitempty" protobuf_key:"bytes,1,opt,name=key,proto3" protobuf_val:"fixed64,2,opt,name=value,proto3"`
-	RequiredPlacementResources      map[string]float64     `protobuf:"bytes,14,rep,name=required_placement_resources,json=requiredPlacementResources,proto3" json:"required_placement_resources,omitempty" protobuf_key:"bytes,1,opt,name=key,proto3" protobuf_val:"fixed64,2,opt,name=value,proto3"`
-	ActorCreationTaskSpec           *ActorCreationTaskSpec `protobuf:"bytes,15,opt,name=actor_creation_task_spec,json=actorCreationTaskSpec,proto3" json:"actor_creation_task_spec,omitempty"`
-	ActorTaskSpec                   *ActorTaskSpec         `protobuf:"bytes,16,opt,name=actor_task_spec,json=actorTaskSpec,proto3" json:"actor_task_spec,omitempty"`
-		1,
-	PlacementGroupId                []byte                 `protobuf:"bytes,18,opt,name=placement_group_id,json=placementGroupId,proto3" json:"placement_group_id,omitempty"`
-	PlacementGroupBundleIndex       int64                  `protobuf:"varint,19,opt,name=placement_group_bundle_index,json=placementGroupBundleIndex,proto3" json:"placement_group_bundle_index,omitempty"`
-	PlacementGroupCaptureChildTasks bool                   `protobuf:"varint,20,opt,name=placement_group_capture_child_tasks,json=placementGroupCaptureChildTasks,proto3" json:"placement_group_capture_child_tasks,omitempty"`
-	OverrideEnvironmentVariables    map[string]string      `protobuf:"bytes,21,rep,name=override_environment_variables,json=overrideEnvironmentVariables,proto3" json:"override_environment_variables,omitempty" protobuf_key:"bytes,1,opt,name=key,proto3" protobuf_val:"bytes,2,opt,name=value,proto3"`
-		skipException,
-	DebuggerBreakpoint              []byte                 `protobuf:"bytes,23,opt,name=debugger_breakpoint,json=debuggerBreakpoint,proto3" json:"debugger_breakpoint,omitempty"`
-	SerializedRuntimeEnv            string     
+	var taskArgs []*generated.TaskArg
+	for _, arg := range args {
+		datum, err := serializer.Serialize(arg)
+		if err != nil {
+			return nil, err
+		}
+		taskArgs = append(taskArgs, &generated.TaskArg{
+			ObjectRef: &generated.ObjectReference{},
+			Data:      datum,
+			Metadata:  new(bytes.Buffer).Bytes(),
+		})
 	}
+
+	funcDescripter := generated.FunctionDescriptor{
+		FunctionDescriptor: &generated.FunctionDescriptor_GoFunctionDescriptor{
+			GoFunctionDescriptor: &generated.GoFunctionDescriptor{
+				FunctionName: rayFunc.FunctionDescriptor.functionName,
+			},
+		},
+	}
+	return &generated.TaskSpec{
+		Type:                       taskType,
+		Name:                       "",
+		Language:                   generated.Language_GO,
+		FunctionDescriptor:         &funcDescripter,
+		JobId:                      jobId,
+		TaskId:                     taskId,
+		ParentTaskId:               new(bytes.Buffer).Bytes(),
+		ParentCounter:              0,
+		CallerId:                   new(bytes.Buffer).Bytes(),
+		CallerAddress:              &generated.Address{},
+		Args:                       taskArgs,
+		NumReturns:                 1,
+		RequiredResources:          make(map[string]float64),
+		RequiredPlacementResources: make(map[string]float64),
+		ActorCreationTaskSpec:      nil,
+		ActorTaskSpec:              nil,
+		MaxRetries:                 3,
+	}, nil
 }

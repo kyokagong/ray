@@ -6,6 +6,6 @@ go_library(
         "common.pb.go",
         "gcs.pb.go",
     ],
-    importpath = "ray/internal/runtime/generated",
+    importpath = "github.com/ray-project/ray/go/internal/runtime/generated",
     visibility = ["//visibility:public"],
 )

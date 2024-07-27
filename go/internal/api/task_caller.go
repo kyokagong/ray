@@ -1,9 +1,11 @@
 package api
 
 import (
-	r "ray/internal/runtime"
-	"ray/internal/runtime/object"
-	"ray/internal/runtime/task"
+	"github.com/ray-project/ray/go/internal/runtime/task"
+
+	"github.com/ray-project/ray/go/internal/runtime/object"
+
+	r "github.com/ray-project/ray/go/internal/runtime"
 )
 
 type TaskCallerInterface interface {
@@ -11,16 +13,17 @@ type TaskCallerInterface interface {
 }
 
 type TaskCaller struct {
-	runtime  r.RunTime
-	function task.FuncType1
+	runtime     r.RunTime
+	funcWrapper task.FunctionWrapper
 }
 
 // Create Golang Task Caller
-func CreateTaskCaller(function task.FuncType1) TaskCaller {
-	return TaskCaller{*r.GetRuntime(), function}
+func NewTaskCaller(funcWrapper task.FunctionWrapper) TaskCaller {
+	return TaskCaller{*r.GetRuntime(), funcWrapper}
 }
 
 // Submit ray function
-func (taskCaller TaskCaller) Remote() object.ObjectRef {
-	return object.ObjectRef{"test"}
+func (taskCaller TaskCaller) Remote(args ...interface{}) (object.ObjectRef, error) {
+	remoteFuncHolder := task.BuildRemoteFunctionHolder(taskCaller.funcWrapper)
+	return taskCaller.runtime.GetInstance().Call(&remoteFuncHolder, args)
 }

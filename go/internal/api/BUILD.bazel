@@ -6,7 +6,7 @@ go_library(
         "ray.go",
         "task_caller.go",
     ],
-    importpath = "ray/internal/api",
+    importpath = "github.com/ray-project/ray/go/internal/api",
     visibility = ["//go:__subpackages__"],
     deps = [
         "//go/internal/runtime:runtime_lib",

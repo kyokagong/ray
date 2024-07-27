@@ -2,8 +2,9 @@ package object_store_test
 
 import (
 	"fmt"
-	"ray/internal/runtime/object"
 	"testing"
+
+	"github.com/ray-project/ray/go/internal/runtime/object"
 
 	"github.com/stretchr/testify/assert"
 )

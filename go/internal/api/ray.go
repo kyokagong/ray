@@ -1,10 +1,10 @@
 package api
 
 import (
-	"ray/internal/runtime"
-	c "ray/internal/runtime/config"
-	"ray/internal/runtime/object"
-	"ray/internal/runtime/task"
+	"github.com/ray-project/ray/go/internal/runtime"
+	c "github.com/ray-project/ray/go/internal/runtime/config"
+	"github.com/ray-project/ray/go/internal/runtime/object"
+	"github.com/ray-project/ray/go/internal/runtime/task"
 )
 
 func RayInitLocalMode() {
@@ -38,16 +38,21 @@ func RayInit(config c.RayConfig) {
 }
 
 // Create a ray remote task
-func RayTask(function task.FuncType1) TaskCaller {
-	return CreateTaskCaller(function)
+func RayTask(fn interface{}) TaskCaller {
+	return NewTaskCaller(task.NewFunctionWrapper(fn))
 }
 
-func RayPut(obj interface{}) object.ObjectRef {
+func RayPut(obj interface{}) (object.ObjectRef, error) {
 	return runtime.GetRuntime().GetInstance().Put(obj)
 }
 
-func RayGet(objRef object.ObjectRef) interface{} {
+func RayGet(objRef object.ObjectRef) (interface{}, error) {
 	return runtime.GetRuntime().GetInstance().Get(objRef)
+}
+
+func RayRemote(fn interface{}) {
+	funcWrapper := task.NewFunctionWrapper(fn)
+	task.GetFunctionManager().RegisterRemoteFunction(funcWrapper)
 }
 
 func RayShutdown() {

@@ -5,6 +5,6 @@ go_library(
     srcs = [
         "common.go",
     ],
-    importpath = "ray/internal/runtime/common",
+    importpath = "github.com/ray-project/ray/go/internal/runtime/common",
     visibility = ["//visibility:public"],
 )

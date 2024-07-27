@@ -20,7 +20,7 @@ go_library(
         "ccore.go",
     ],
     cgo = True,
-    importpath = "ray/internal/ccore",
+    importpath = "github.com/ray-project/ray/go/internal/ccore",
     visibility = ["//visibility:public"],
     cdeps = [
         ":ccore_native_lib",

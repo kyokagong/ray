@@ -1,8 +1,5 @@
 package task
 
-type TaskExecutor struct {
-}
-
-func ExecuteTask() {
-	
+type TaskExecutor interface {
+	ExecuteTask()
 }

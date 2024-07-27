@@ -1,14 +1,14 @@
 package runtime
 
 import (
-	"ray/internal/runtime/config"
-	"ray/internal/runtime/object"
-	"ray/internal/runtime/runner"
-	"ray/internal/runtime/task"
+	"github.com/ray-project/ray/go/internal/runtime/config"
+	"github.com/ray-project/ray/go/internal/runtime/object"
+	"github.com/ray-project/ray/go/internal/runtime/runner"
+	"github.com/ray-project/ray/go/internal/runtime/task"
 )
 
 type RunTime struct {
-	functionManager task.FunctionManager
+	functionManager *task.FunctionManager
 	Instance        RayRuntimeInterface
 }
 
@@ -27,19 +27,19 @@ func GetRuntime() *RunTime {
 
 // RayRuntime contains basic runtime function
 type RayRuntimeInterface interface {
-	Call(remoteFunctionHolder task.RemoteFunctionHolder, args interface{}) object.ObjectRef
-	Put(interface{}) object.ObjectRef
-	Get(object.ObjectRef) interface{}
-	Wait()
+	Call(*task.RemoteFunctionHolder, []interface{}) (object.ObjectRef, error)
+	Put(interface{}) (object.ObjectRef, error)
+	Get(object.ObjectRef) (interface{}, error)
+	Wait() error
 }
 
 // 初始化runtime
 func InitRayRuntime(rayConfig config.RayConfig) {
 	functiomManager := task.GetFunctionManager()
 	if rayConfig.LocalMode {
-		runtime = &RunTime{functiomManager, InitLocalRuntime()}
+		runtimeInstance := NewLocalRuntime()
+		runtime = &RunTime{functiomManager, &runtimeInstance}
 	} else {
 		runner.StartRayHead(rayConfig)
-
 	}
 }
